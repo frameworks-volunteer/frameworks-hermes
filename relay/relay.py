@@ -253,11 +253,34 @@ def spawn_rescue(stuck_spawn_id: str, stuck_log_file: str,
     except Exception:
         pass
 
+    # Check if original spawn already submitted a review or comment
+    original_already_acted = False
+    action_summary = ""
+    if "gh pr review" in stuck_output and "successfully" in stuck_output.lower():
+        original_already_acted = True
+        action_summary = "The original session already submitted a PR review."
+    elif "gh pr comment" in stuck_output and "successfully" in stuck_output.lower():
+        original_already_acted = True
+        action_summary = "The original session already submitted a PR comment."
+    elif "gh issue comment" in stuck_output and "successfully" in stuck_output.lower():
+        original_already_acted = True
+        action_summary = "The original session already submitted an issue comment."
+
     rescue_prompt = (
         "You are a rescue agent. Another Hermes session got stuck or hung.\n"
         "\n"
         f"STUCK SPAWN: {stuck_spawn_id}\n"
         "\n"
+    )
+    if original_already_acted:
+        rescue_prompt += (
+            f"*** IMPORTANT: {action_summary} ***\n"
+            "Do NOT submit another review or comment. The task is already done.\n"
+            "Only clean up (switch branches, remove worktrees) if needed.\n"
+            "If the original session's output looks complete, just exit.\n"
+            "\n"
+        )
+    rescue_prompt += (
         "ORIGINAL PROMPT (first 2000 chars):\n"
         f"{stuck_prompt}\n"
         "\n"
@@ -270,9 +293,22 @@ def spawn_rescue(stuck_spawn_id: str, stuck_log_file: str,
         "  - Infinite loop or retry loop\n"
         "  - Waiting for user input\n"
         "\n"
+    )
+    if not original_already_acted:
+        rescue_prompt += (
+            "If you need to continue the work (submit a review, comment, etc.):\n"
+            "  - CHECK existing reviews/comments FIRST before submitting anything.\n"
+            f"    Use: gh api repos/{ALLOWED_REPO}/pulls/NUMBER/reviews\n"
+            "    Use: gh api repos/{ALLOWED_REPO}/issues/NUMBER/comments\n"
+            "  - NEVER submit a duplicate review or comment.\n"
+            f"  - If a review already exists from {BOT_USERNAME}, do NOT submit another.\n"
+            "\n"
+        )
+    rescue_prompt += (
         "Then either:\n"
         "  1. Leave a comment on the issue/PR explaining what happened\n"
         "  2. Continue the work if you can (commit, push, PR)\n"
+        "  3. If the original session already completed the task, just exit\n"
         "\n"
         f"Repo is at: {REPO_PATH}\n"
         "Use gh CLI for GitHub API calls.\n"
@@ -426,7 +462,8 @@ def classify_event(event_type: str, action: str, payload: dict) -> dict | None:
         explicit_request = any(
             kw in body.lower()
             for kw in ["please fix", "please review", "please look", "take a look",
-                        "can you", "could you", "needs review", "frameworks-volunteer"]
+                        "can you", "could you", "needs review",
+                        BOT_USERNAME.lower()]
         )
         if not (mentions_bot or explicit_request):
             return None
@@ -446,7 +483,8 @@ def classify_event(event_type: str, action: str, payload: dict) -> dict | None:
         explicit_request = any(
             kw in body.lower()
             for kw in ["please fix", "please review", "please look", "take a look",
-                        "can you", "could you", "needs review", "frameworks-volunteer"]
+                        "can you", "could you", "needs review",
+                        BOT_USERNAME.lower()]
         )
         if not (mentions_bot or explicit_request):
             return None
@@ -465,7 +503,8 @@ def classify_event(event_type: str, action: str, payload: dict) -> dict | None:
         explicit_request = any(
             kw in body.lower()
             for kw in ["please fix", "please review", "please look", "take a look",
-                        "can you", "could you", "needs review", "frameworks-volunteer"]
+                        "can you", "could you", "needs review",
+                        BOT_USERNAME.lower()]
         )
         if not (mentions_bot or explicit_request):
             return None
@@ -517,7 +556,7 @@ def build_prompt(classified: dict, provider: str, model: str,
     """Build a one-shot prompt for Hermes."""
     scope = classified["scope"]
     lines = [
-        "You are frameworks-volunteer, a reactive GitHub agent for "
+        "You are a reactive GitHub agent for "
         "security-alliance/frameworks.",
         "",
         "Load the skill: frameworks-reactive-github",
@@ -528,16 +567,16 @@ def build_prompt(classified: dict, provider: str, model: str,
         f"**Model:** `{model}`  **Reasoning:** `{reasoning}`  **Provider:** `{provider}`",
         "",
         "FORK WORKFLOW:",
-        "  - origin = frameworks-volunteer/frameworks (fork, push here)",
+        f"  - origin = {BOT_USERNAME}/frameworks (fork, push here)",
         "  - upstream = security-alliance/frameworks (official, PRs/issues here)",
         "  - NEVER push to upstream. Always push branches to origin, then open PRs.",
-        "  - Use: gh pr create --repo security-alliance/frameworks --head frameworks-volunteer:BRANCH",
+        f"  - Use: gh pr create --repo security-alliance/frameworks --head {BOT_USERNAME}:BRANCH",
         "  - ALL COMMITS MUST BE GPG-SIGNED: always use git commit -S",
         "",
     ]
 
     if self_review == "1":
-        lines.append("SELF-REVIEW: This PR was authored by frameworks-volunteer.")
+        lines.append(f"SELF-REVIEW: This PR was authored by {BOT_USERNAME}.")
         lines.append(f"You MUST use `{provider}/{model}` (not the default model).")
         lines.append("")
 
@@ -569,7 +608,10 @@ def build_prompt(classified: dict, provider: str, model: str,
             "1. Fetch PR details",
             "2. Run security review (Procedure 4)",
             "3. Run QA review (Procedure 5)",
-            "4. Submit review with the mandatory prefix",
+            "4. Before submitting, CHECK for existing reviews from this bot:",
+            f"   gh api repos/{ALLOWED_REPO}/pulls/{num}/reviews --jq '.[] | select(.user.login==\"{BOT_USERNAME}\") | .id'",
+            "   If a review already exists, do NOT submit another. Comment instead.",
+            "5. Submit ONE review with the mandatory prefix",
             "",
             f"Repo is at: {REPO_PATH}",
             f"Use: gh pr view {num} --repo {ALLOWED_REPO}",
@@ -577,7 +619,7 @@ def build_prompt(classified: dict, provider: str, model: str,
     elif scope == "issue_comment":
         num = classified["issue_number"]
         lines += [
-            f"Comment on issue #{num} mentions @frameworks-volunteer",
+            f"Comment on issue #{num} mentions @{BOT_USERNAME}",
             "",
             "Follow Procedure 6 from the skill:",
             "1. Read the issue and prior comments",
@@ -591,7 +633,7 @@ def build_prompt(classified: dict, provider: str, model: str,
     elif scope == "pr_comment":
         num = classified["issue_number"]
         lines += [
-            f"Comment on PR thread #{num} mentions @frameworks-volunteer",
+            f"Comment on PR thread #{num} mentions @{BOT_USERNAME}",
             "",
             "Follow Procedure 6/8 from the skill:",
             "1. Read the PR and prior comments",
@@ -605,7 +647,7 @@ def build_prompt(classified: dict, provider: str, model: str,
     elif scope == "pr_review":
         num = classified["pr_number"]
         lines += [
-            f"Review on PR #{num} mentions @frameworks-volunteer",
+            f"Review on PR #{num} mentions @{BOT_USERNAME}",
             "",
             "Follow Procedure 7 from the skill:",
             "1. Read the review context",
@@ -619,7 +661,7 @@ def build_prompt(classified: dict, provider: str, model: str,
     elif scope == "pr_review_comment":
         num = classified["pr_number"]
         lines += [
-            f"Review comment on PR #{num} mentions @frameworks-volunteer",
+            f"Review comment on PR #{num} mentions @{BOT_USERNAME}",
             "",
             "Follow Procedure 7 from the skill:",
             "1. Read the comment context",
@@ -757,9 +799,18 @@ def spawn_hermes(prompt: str, provider: str, model: str,
                 if (stuck_duration > STUCK_TIMEOUT and
                         not stuck_rescue_sent):
                     log.warning("[spawn %s] STUCK: no output for %ds -- "
-                                "spawning rescue agent",
+                                "spawning rescue agent, killing original",
                                 spawn_id, int(stuck_duration))
                     stuck_rescue_sent = True
+                    # Kill the stuck spawn immediately to prevent it from
+                    # racing with the rescue agent (e.g., both submitting
+                    # reviews on the same PR).
+                    try:
+                        proc.kill()
+                        log.info("[spawn %s] Killed stuck process (PID %d)",
+                                 spawn_id, proc.pid)
+                    except OSError:
+                        pass
                     # Spawn rescue in a separate thread
                     rt = threading.Thread(
                         target=spawn_rescue,
