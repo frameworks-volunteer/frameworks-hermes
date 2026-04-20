@@ -312,6 +312,12 @@ def spawn_rescue(stuck_spawn_id: str, stuck_log_file: str,
         "\n"
         f"Repo is at: {REPO_PATH}\n"
         "Use gh CLI for GitHub API calls.\n"
+        "GH BODY RULE: Never use --body with inline text. Always use --body-file\n"
+        "with a heredoc to prevent shell expansion of backticks:\n"
+        "  cat > /tmp/${SPAWN_ID}_body.md << 'EOF'\n"
+        "  (content)\n"
+        "  EOF\n"
+        "  gh pr review NUM --approve --body-file /tmp/${SPAWN_ID}_body.md\n"
         "Every response MUST start with: "
         "**Model:** `rescue` **Reasoning:** `high` **Provider:** `rescue`\n"
     )
@@ -678,6 +684,16 @@ def build_prompt(classified: dict, provider: str, model: str,
     lines.append(f"  **Model:** `{model}` **Reasoning:** `{reasoning}` **Provider:** `{provider}`")
     lines.append("")
     lines.append("Work in the repo directory. Use gh CLI for all GitHub API calls.")
+    lines.append("")
+    lines.append("GH BODY RULE: Never use --body with inline text (double quotes mangle")
+    lines.append("backticks as command substitution). Always use --body-file with a heredoc:")
+    lines.append("  cat > /tmp/${SPAWN_ID}_body.md << 'EOF'")
+    lines.append("  (content here)")
+    lines.append("  EOF")
+    lines.append("  gh pr review NUM --approve --body-file /tmp/${SPAWN_ID}_body.md")
+    lines.append("The single-quoted 'EOF' prevents ALL shell expansion. Use $SPAWN_ID in")
+    lines.append("filenames to avoid collisions if multiple spawns run concurrently.")
+    lines.append("")
     lines.append("When done, exit. Do not wait for further input.")
 
     return "\n".join(lines)
@@ -762,7 +778,8 @@ def spawn_hermes(prompt: str, provider: str, model: str,
                      "GIT_EDITOR": "true",
                      "GIT_SEQUENCE_EDITOR": "true",
                      "EDITOR": "true",
-                     "VISUAL": "true"},
+                     "VISUAL": "true",
+                     "SPAWN_ID": spawn_id},
             )
             # Close slave in parent -- child has its copy
             os.close(slave_fd)
