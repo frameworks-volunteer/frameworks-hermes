@@ -775,6 +775,7 @@ def spawn_hermes(prompt: str, provider: str, model: str,
             stuck_rescue_sent = False
             buf = ""  # accumulate partial lines
             pending_danger = None  # track multi-line dangerous prompt
+            completed_actions = set()  # track submitted reviews/comments
 
             def _timed_out():
                 return (time.time() - start_time) > MAX_SPAWN_SECONDS
@@ -889,6 +890,27 @@ def spawn_hermes(prompt: str, provider: str, model: str,
                         tool_count += 1
                         log.info("[spawn %s] Tool: %s", spawn_id,
                                  stripped.strip()[:120])
+
+                        # Detect duplicate review/comment submissions.
+                        # If the agent already submitted one and tries
+                        # again, kill the spawn to prevent spam.
+                        for action_type, pattern in [
+                            ("review", "gh pr review"),
+                            ("pr_comment", "gh pr comment"),
+                            ("issue_comment", "gh issue comment"),
+                        ]:
+                            if pattern in stripped:
+                                if action_type in completed_actions:
+                                    log.error(
+                                        "[spawn %s] DUPLICATE %s detected "
+                                        "-- killing spawn to prevent spam",
+                                        spawn_id, action_type)
+                                    try:
+                                        proc.kill()
+                                    except OSError:
+                                        pass
+                                else:
+                                    completed_actions.add(action_type)
 
                     # Log Hermes responses (assistant output)
                     elif "Hermes" in stripped and "─" not in stripped and stripped.strip():
