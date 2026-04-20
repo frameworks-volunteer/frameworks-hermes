@@ -78,7 +78,7 @@ fi
 info "Gathering configuration..."
 
 ask "Your system username" USER_NAME "$(whoami)"
-ask "Bot GitHub username" BOT_USERNAME "frameworks-volunteer"
+ask_required "Bot GitHub username" BOT_USERNAME
 ask "Upstream repository" UPSTREAM_REPO "security-alliance/frameworks"
 ask "Fork repository (your bot's fork)" FORK_REPO "${BOT_USERNAME}/frameworks"
 ask "Whitelisted senders (comma-separated)" ALLOWED_SENDERS ""
@@ -104,6 +104,17 @@ if hermes profile list 2>/dev/null | grep -q "frameworks"; then
 else
   hermes profile import "$SCRIPT_DIR/profile/frameworks.tar.gz" --name frameworks
   info "Profile 'frameworks' imported."
+fi
+
+# Generate SOUL.md from template with user's values
+SOUL_PATH="$HOME/.hermes/profiles/frameworks/SOUL.md"
+if [[ -f "$SCRIPT_DIR/profile/SOUL.md.template" ]]; then
+  sed -e "s|{{BOT_USERNAME}}|${BOT_USERNAME}|g" \
+      -e "s|{{ALLOWED_SENDERS}}|${ALLOWED_SENDERS}|g" \
+      "$SCRIPT_DIR/profile/SOUL.md.template" > "$SOUL_PATH"
+  info "SOUL.md generated for ${BOT_USERNAME} with senders: ${ALLOWED_SENDERS}"
+else
+  warn "No SOUL.md.template found. Profile will use the placeholder."
 fi
 
 # ---------- GPG key ----------
