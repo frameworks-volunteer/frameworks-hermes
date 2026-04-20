@@ -1,0 +1,14 @@
+[Unit]
+Description=Cloudflare Tunnel (frameworks-gh)
+After=network.target frameworks-gh-relay.service
+Wants=frameworks-gh-relay.service
+
+[Service]
+Type=notify
+ExecStart=/home/REPLACE_ME/.local/bin/cloudflared --no-autoupdate tunnel run --token CLOUDFLARE_TUNNEL_TOKEN
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=30
+
+[Install]
+WantedBy=default.target

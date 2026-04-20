@@ -1,0 +1,14 @@
+[Unit]
+Description=Frameworks GitHub Webhook Relay
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/REPLACE_ME/ops/frameworks-gh-relay/relay.py
+WorkingDirectory=/home/REPLACE_ME/ops/frameworks-gh-relay
+Restart=on-failure
+RestartSec=5
+Environment=PATH=/home/REPLACE_ME/.local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target

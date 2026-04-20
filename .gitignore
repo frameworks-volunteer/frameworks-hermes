@@ -1,0 +1,8 @@
+*.pyc
+__pycache__/
+.env
+config.env
+deliveries.db
+relay.log
+dangerous_cmds.log
+spawns/
