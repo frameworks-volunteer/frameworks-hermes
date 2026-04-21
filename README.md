@@ -90,6 +90,8 @@ GitHub webhook --> Cloudflare tunnel --> relay (port 9191)
 frameworks-hermes/
   setup.sh                    # Main setup script (7 steps)
   README.md                   # This file
+  docs/
+    opencode-worker-design.md # Future: OpenCode as relay worker (design doc)
   profile/
     frameworks.tar.gz         # Hermes profile skeleton (SOUL.md only, no identity)
     SOUL.md.template          # Agent personality template ({{BOT_USERNAME}}, {{ALLOWED_SENDERS}})
