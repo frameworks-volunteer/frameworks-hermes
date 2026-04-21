@@ -927,12 +927,14 @@ def spawn_hermes(prompt: str, provider: str, model: str,
                         # Detect duplicate review/comment submissions.
                         # If the agent already submitted one and tries
                         # again, kill the spawn to prevent spam.
+                        # Use regex with actual numbers so the literal
+                        # `gh pr review NUM` in the prompt does NOT match.
                         for action_type, pattern in [
-                            ("review", "gh pr review"),
-                            ("pr_comment", "gh pr comment"),
-                            ("issue_comment", "gh issue comment"),
+                            ("review", r"gh pr review\s+\d+"),
+                            ("pr_comment", r"gh pr comment\s+\d+"),
+                            ("issue_comment", r"gh issue comment\s+\d+"),
                         ]:
-                            if pattern in stripped:
+                            if re.search(pattern, stripped):
                                 if action_type in completed_actions:
                                     log.error(
                                         "[spawn %s] DUPLICATE %s detected "
