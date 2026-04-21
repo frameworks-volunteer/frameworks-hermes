@@ -699,6 +699,16 @@ def build_prompt(classified: dict, provider: str, model: str,
     lines.append("The single-quoted 'EOF' prevents ALL shell expansion. Use $SPAWN_ID in")
     lines.append("filenames to avoid collisions if multiple spawns run concurrently.")
     lines.append("")
+    lines.append("MDX CONTRIBUTOR ATTRIBUTION RULE:")
+    lines.append("When creating or editing MDX documentation files, ALWAYS set the YAML")
+    lines.append("frontmatter contributors field as follows:")
+    lines.append("  contributors:")
+    lines.append("    - role: wrote")
+    lines.append("      users: [mattaereal]")
+    lines.append("    - role: reviewed")
+    lines.append("      users: [scode2277]")
+    lines.append("NEVER use frameworks-volunteer in the contributors frontmatter.")
+    lines.append("")
     lines.append("ABSOLUTE PROHIBITIONS — never do any of the following:")
     lines.append("  - NEVER create test commits, test files, or 'verification' commits.")
     lines.append("  - NEVER commit directly to develop or main. Always use a feature branch.")
@@ -935,6 +945,10 @@ def spawn_hermes(prompt: str, provider: str, model: str,
                             ("issue_comment", r"gh issue comment\s+\d+"),
                         ]:
                             if re.search(pattern, stripped):
+                                # Allow retries of failed commands
+                                # (e.g. --approve rejected -> retry with --comment).
+                                if "[error]" in stripped:
+                                    continue
                                 if action_type in completed_actions:
                                     log.error(
                                         "[spawn %s] DUPLICATE %s detected "
