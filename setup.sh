@@ -95,7 +95,20 @@ fi
 
 ask_required "GitHub Personal Access Token (classic, repo+workflow+read:org)" GITHUB_TOKEN
 
+ask "Model fallback chain (provider/model, comma-separated)" MODEL_CHAIN \
+    "openrouter/moonshotai/kimi-k2.6,openrouter/minimax/MiniMax-M2.7"
+ask "Self-review models (alternate models for reviewing your own PRs)" SELF_REVIEW_MODELS \
+    "openrouter/minimax/MiniMax-M2.7,openrouter/moonshotai/kimi-k2.6"
+
 # ---------- Hermes profile ----------
+
+# Check gh auth
+info "Checking gh CLI authentication..."
+if ! gh auth status &>/dev/null; then
+  error "gh CLI is not authenticated. Run: gh auth login"
+  exit 1
+fi
+info "gh CLI authenticated."
 
 info "Step 1/7: Importing Hermes 'frameworks' profile..."
 
@@ -152,9 +165,8 @@ info "Step 3/7: Configuring git..."
 git config --global user.name "$BOT_USERNAME"
 git config --global user.email "$GPG_EMAIL"
 git config --global user.signingkey "$GPG_KEY_ID"
-git config --global commit.gpgsign true
-git config --global tag.gpgsign true
-info "Global git config updated."
+info "Global git config updated (name/email/signingkey)."
+warn "NOTE: commit.gpgsign and tag.gpgsign are set per-repo in the frameworks clone."
 
 # ---------- Relay setup ----------
 
@@ -184,12 +196,15 @@ else
   cp "$SCRIPT_DIR/relay/config.env.template" "$RELAY_DIR/config.env"
   # Replace placeholders
   sed_replace "$RELAY_DIR/config.env" "REPLACE_ME" "$USER_NAME"
-  sed_replace "$RELAY_DIR/config.env" "<REQUIRED>" "" # clear placeholders
-  # Now set the actual values
-  sed_replace "$RELAY_DIR/config.env" "GITHUB_WEBHOOK_SECRET=" "GITHUB_WEBHOOK_SECRET=$GITHUB_WEBHOOK_SECRET"
-  sed_replace "$RELAY_DIR/config.env" "GITHUB_TOKEN=" "GITHUB_TOKEN=$GITHUB_TOKEN"
-  sed_replace "$RELAY_DIR/config.env" "BOT_USERNAME=" "BOT_USERNAME=$BOT_USERNAME"
-  sed_replace "$RELAY_DIR/config.env" "ALLOWED_SENDERS=" "ALLOWED_SENDERS=$ALLOWED_SENDERS"
+  # Set the actual values (do <REQUIRED> clearing via specific replacements)
+  sed_replace "$RELAY_DIR/config.env" "GITHUB_WEBHOOK_SECRET=<REQUIRED>" "GITHUB_WEBHOOK_SECRET=$GITHUB_WEBHOOK_SECRET"
+  sed_replace "$RELAY_DIR/config.env" "GITHUB_TOKEN=<REQUIRED>" "GITHUB_TOKEN=$GITHUB_TOKEN"
+  sed_replace "$RELAY_DIR/config.env" "BOT_USERNAME=<REQUIRED>" "BOT_USERNAME=$BOT_USERNAME"
+  sed_replace "$RELAY_DIR/config.env" "ALLOWED_SENDERS=<REQUIRED>" "ALLOWED_SENDERS=$ALLOWED_SENDERS"
+  sed_replace "$RELAY_DIR/config.env" "MODEL_CHAIN=<REQUIRED>" "MODEL_CHAIN=$MODEL_CHAIN"
+  sed_replace "$RELAY_DIR/config.env" "SELF_REVIEW_MODELS=<REQUIRED>" "SELF_REVIEW_MODELS=$SELF_REVIEW_MODELS"
+  # Clear any remaining <REQUIRED> placeholders
+  sed_replace "$RELAY_DIR/config.env" "<REQUIRED>" ""
   chmod 600 "$RELAY_DIR/config.env"
   info "config.env generated with your values."
 fi
@@ -203,6 +218,11 @@ FW_DIR="$HOME/frameworks"
 if [[ -d "$FW_DIR" ]]; then
   warn "$FW_DIR already exists. Skipping clone."
 else
+  if ! gh api "repos/${FORK_REPO}" &>/dev/null; then
+    error "Fork ${FORK_REPO} not found on GitHub."
+    error "Fork it first: https://github.com/${UPSTREAM_REPO}/fork"
+    exit 1
+  fi
   git clone "https://github.com/${FORK_REPO}.git" "$FW_DIR"
   cd "$FW_DIR"
   git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
@@ -212,6 +232,8 @@ else
   git config --local user.name "$BOT_USERNAME"
   git config --local user.email "$GPG_EMAIL"
   git config --local user.signingkey "$GPG_KEY_ID"
+  git config --local commit.gpgsign true
+  git config --local tag.gpgsign true
   # Exclude .worktrees
   echo ".worktrees/" >> .git/info/exclude
   info "Frameworks repo cloned and configured."

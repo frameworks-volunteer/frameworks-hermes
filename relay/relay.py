@@ -50,32 +50,37 @@ WEBHOOK_SECRET  = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
 ALLOWED_REPO    = os.environ.get("ALLOWED_REPO", "security-alliance/frameworks")
 BOT_USERNAME    = os.environ.get("BOT_USERNAME", "frameworks-volunteer")
 ALLOWED_SENDERS = [s.strip().lower() for s in os.environ.get("ALLOWED_SENDERS", "").split(",") if s.strip()]
-# Model fallback chain: tried in order until one works.
+
+# Model fallback chain: must be configured via MODEL_CHAIN env var.
 # Format: provider/model, comma-separated. First is primary.
+_model_chain_raw = os.environ.get("MODEL_CHAIN", "")
+if not _model_chain_raw:
+    print("ERROR: MODEL_CHAIN not configured. Set it in config.env.", file=sys.stderr)
+    sys.exit(1)
 MODEL_CHAIN = [
     tuple(m.strip().split("/", 1))
-    for m in os.environ.get(
-        "MODEL_CHAIN",
-        "openrouter/z-ai/glm-5.1,"
-        "openrouter/minimax/MiniMax-M2.7,"
-        "openrouter/kimi-coding-cn/kimi-k2.5"
-    ).split(",") if m.strip()
+    for m in _model_chain_raw.split(",") if m.strip()
 ]
+if not MODEL_CHAIN:
+    print("ERROR: MODEL_CHAIN is empty. Check config.env.", file=sys.stderr)
+    sys.exit(1)
+
 # Backwards compat: single DEFAULT_MODEL still works
 if os.environ.get("DEFAULT_MODEL"):
     dp = os.environ.get("DEFAULT_PROVIDER", "openrouter")
     MODEL_CHAIN.insert(0, (dp, os.environ["DEFAULT_MODEL"]))
 
 # Self-review alternates (used when reviewing bot's own PRs)
-SELF_REVIEW_MODELS = [
-    tuple(m.strip().split("/", 1))
-    for m in os.environ.get(
-        "SELF_REVIEW_MODELS",
-        "openrouter/minimax/MiniMax-M2.7,"
-        "openrouter/kimi-coding-cn/kimi-k2.5"
-    ).split(",") if m.strip()
-]
-HERMES_BIN      = os.environ.get("HERMES_BIN", "/home/zealot/.local/bin/hermes")
+_self_review_raw = os.environ.get("SELF_REVIEW_MODELS", "")
+if _self_review_raw:
+    SELF_REVIEW_MODELS = [
+        tuple(m.strip().split("/", 1))
+        for m in _self_review_raw.split(",") if m.strip()
+    ]
+else:
+    # Default to MODEL_CHAIN[1:] if not configured
+    SELF_REVIEW_MODELS = MODEL_CHAIN[1:] if len(MODEL_CHAIN) > 1 else MODEL_CHAIN[:]
+HERMES_BIN      = os.environ.get("HERMES_BIN", "hermes")
 REPO_PATH       = os.environ.get("REPO_PATH", "/home/zealot/frameworks")
 RELAY_PORT      = int(os.environ.get("RELAY_PORT", "9191"))
 DELIVERY_DB     = os.environ.get("DELIVERY_DB", str(Path(__file__).parent / "deliveries.db"))
