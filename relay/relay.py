@@ -699,6 +699,16 @@ def build_prompt(classified: dict, provider: str, model: str,
     lines.append("The single-quoted 'EOF' prevents ALL shell expansion. Use $SPAWN_ID in")
     lines.append("filenames to avoid collisions if multiple spawns run concurrently.")
     lines.append("")
+    lines.append("ABSOLUTE PROHIBITIONS — never do any of the following:")
+    lines.append("  - NEVER create test commits, test files, or 'verification' commits.")
+    lines.append("  - NEVER commit directly to develop or main. Always use a feature branch.")
+    lines.append("  - NEVER pipe output to python3, bash, sh, ruby, node, or any interpreter.")
+    lines.append("    (e.g. 'cat file | python3' or 'echo ... | bash' are FORBIDDEN).")
+    lines.append("  - If Hermes flags a command as dangerous and denies it, do NOT retry")
+    lines.append("    a similar command. Switch to file tools (read_file, search_files).")
+    lines.append("  - NEVER run interactive commands that wait for input (nano, vim, less).")
+    lines.append("  - NEVER use 'git commit' without '-S' (GPG signing is MANDATORY).")
+    lines.append("")
     lines.append("When done, exit. Do not wait for further input.")
 
     return "\n".join(lines)
@@ -870,8 +880,9 @@ def spawn_hermes(prompt: str, provider: str, model: str,
                         continue
                     chunk = os.read(master_fd, 4096).decode(
                         "utf-8", errors="replace")
-                    buf += chunk
-                    last_output_time = time.time()
+                    if chunk:
+                        buf += chunk
+                        last_output_time = time.time()
                 except (OSError, ValueError):
                     # PTY closed
                     break
