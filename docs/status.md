@@ -69,3 +69,13 @@ Excluded:
 
 3. Relay needs restart after code changes: The running relay still has old
    code in memory. Run: systemctl --user restart frameworks-gh-relay.service
+
+## Resolved Issues
+
+1. PR #513 heredoc failure (fixed 2026-06-25): The agent mangled a bash
+   heredoc into a single-line command, it timed out at 60s, the retry also
+   timed out, and the PTY duplicate guard killed the spawn before any review
+   was posted. Fixed by:
+   - Replacing heredoc instructions with write_file tool instructions
+   - Adding [BLOCKED]/Blocked:/denied to the duplicate guard skip conditions
+   so failed/blocked commands don't count as completed actions.

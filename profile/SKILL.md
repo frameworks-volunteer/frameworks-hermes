@@ -495,7 +495,7 @@ update-safe. Nothing in this setup requires modifying hermes-agent code.
   read chunk is actually non-empty. Empty reads from a live-but-silent
   child must NOT reset the timer.
 
-### GH Body Rule (--body-file heredoc)
+### GH Body Rule (write_file + --body-file)
 
   NEVER use --body with inline text when calling gh CLI commands.
   Double quotes cause bash to expand backticks as command substitution,
@@ -505,13 +505,19 @@ update-safe. Nothing in this setup requires modifying hermes-agent code.
   prefix, the agent thought it failed, retried with single quotes,
   and both submissions went through.
 
-  ALWAYS use --body-file with a heredoc:
-    cat > /tmp/${SPAWN_ID}_body.md << 'EOF'
-    (content with backticks, dollar signs, etc.)
-    EOF
-    gh pr review NUM --approve --body-file /tmp/${SPAWN_ID}_body.md
+  NEVER use bash heredocs (cat << 'EOF') either. Models frequently
+  mangle multi-line heredocs into single-line commands that timeout
+  or produce broken files. This caused the PR #513 review failure:
+  the agent compressed the heredoc and gh command into one line,
+  it timed out at 60s, the retry also timed out, and the PTY duplicate
+  guard killed the spawn before any review was posted.
 
-  The single-quoted 'EOF' prevents ALL shell expansion.
+  ALWAYS use the write_file tool to create the body file, then
+  submit with --body-file:
+    1. Use write_file to create /tmp/${SPAWN_ID}_body.md with the
+       review/comment body (including backticks, dollar signs, etc.)
+    2. Run: gh pr review NUM --approve --body-file /tmp/${SPAWN_ID}_body.md
+
   $SPAWN_ID is a unique env var set by the relay per spawn, preventing
   filename collisions when multiple spawns run concurrently.
 
@@ -702,6 +708,24 @@ The relay should verify after exit=0:
 This is a known gap. The current workaround: manual intervention when
 you see "Done: exit=0" but no PR link in the relay log.
 
+A SECOND variant: the agent completes the analysis (e.g. a full PR
+review) but the final `gh pr review` / `gh pr comment` call fails with
+HTTP 401 (expired PAT) or HTTP 403 (insufficient permissions). The
+relay logs "Completed: pr_review_requested" and exits 0 because Hermes
+itself did not crash -- the GitHub API rejection is an operational
+error, not a process failure. The relay's crash detection looks for
+"API key was rejected", "Traceback", "ModuleNotFoundError" -- none of
+which match a 401/403. So the relay considers the spawn successful and
+does not retry with a fallback model.
+
+Detection: after a "Completed:" log line for a review scope, check:
+  gh api repos/security-alliance/frameworks/pulls/NUM/reviews \
+    --jq '[.[] | select(.user.login=="frameworks-volunteer")] | length'
+If the count is 0, the review was not posted. Search the spawn output
+log for "401" or "PAT expired" to confirm the cause.
+
+Recovery: see `references/pat-expiry-missed-reviews.md`.
+
 1. NEVER pass read_file() output directly to write_file() -- read_file
    prepends "N|" line numbers which get baked into the file. Always
    process/strip line numbers first, or use patch/terminal sed instead.
@@ -764,9 +788,13 @@ you see "Done: exit=0" but no PR link in the relay log.
     verification silently fails (falls through to the "not configured"
     branch). Verify with: python3 -c "import ast; ast.parse(open('relay.py').read())"
 
-13. GH BODY RULE: Never use --body with inline gh CLI text. Always
-    use --body-file with a heredoc (single-quoted EOF). See
+13. GH BODY RULE: Never use --body with inline gh CLI text. Never use
+    bash heredocs either (models mangle them). Use the write_file tool
+    to create the body file, then gh CLI with --body-file. See
     GH Body Rule section above for the full pattern and root cause.
+    PR #513 review was lost because the agent compressed a heredoc
+    into a single line, it timed out, and the duplicate guard killed
+    the spawn on retry.
 
 14. SPAWN_ID env var is available in every Hermes spawn (set by the
     relay). Use it in temp filenames to avoid collisions:
@@ -877,6 +905,18 @@ you see "Done: exit=0" but no PR link in the relay log.
           continue
     This allows the agent to retry with a different flag (comment vs
     approve) without being killed.
+
+    ADDITIONAL FIX (PR #513): The guard must ALSO skip lines containing
+    `[BLOCKED]`, `Blocked:`, or `denied` -- these indicate the command
+    was auto-denied by the PTY dangerous-command guard and never reached
+    the GitHub API. Without this, a heredoc command that times out and
+    gets blocked counts as a "completed action", and the retry is killed
+    as a duplicate even though no review was ever posted.
+
+      if "[error]" in stripped or "[BLOCKED]" in stripped:
+          continue
+      if "Blocked:" in stripped or "denied" in stripped.lower():
+          continue
 
 19. MDX contributor frontmatter is NOT the same as git authorship. The
     frameworks repo uses YAML frontmatter `contributors` with roles
@@ -1070,6 +1110,33 @@ The sender extraction block looks like:
 
 If you forget this step, ANY GitHub user (not just the whitelist) can
 trigger the agent by mentioning @frameworks-volunteer in a discussion.
+
+### "Can you" Keyword Trigger Is Too Broad
+
+The relay's classify_event() for issue_comment, pull_request_review,
+pull_request_review_comment, discussion, and discussion_comment checks
+for "explicit request" keywords including "can you" and "could you".
+These phrases are common in normal English and match comments that are
+NOT addressed to the bot.
+
+Example (PR #529, 2026-06-25): scode2277 posted a comment to
+@DicksonWu654 containing "Can you try again" and "Can you re-check".
+The relay matched "can you" and spawned the bot, which then tried to
+respond but couldn't (PAT expired). The comment was not addressed to
+@frameworks-volunteer at all.
+
+Mitigation options (not yet implemented):
+  1. Require @mention as the ONLY trigger (drop keyword matching).
+     Pro: zero false positives. Con: users must always @mention.
+  2. Narrow keywords to imperative phrases: "please fix", "please review",
+     "take a look at this" -- drop "can you" and "could you" which are
+     questions, not commands.
+  3. Keep keywords but require @mention OR (keyword AND reply-to-bot).
+     The webhook payload includes `in_reply_to_id` for issue comments --
+     if the comment is a reply to a bot comment, keywords are safe.
+
+Until this is fixed, expect occasional false-positive spawns on comments
+that happen to contain "can you" but are not addressed to the bot.
 
 ### write_file Stale Caching When Fed From read_file
 

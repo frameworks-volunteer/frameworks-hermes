@@ -381,12 +381,10 @@ def spawn_rescue(stuck_spawn_id: str, stuck_log_file: str,
         "\n"
         f"Repo is at: {REPO_PATH}\n"
         "Use gh CLI for GitHub API calls.\n"
-        "GH BODY RULE: Never use --body with inline text. Always use --body-file\n"
-        "with a heredoc to prevent shell expansion of backticks:\n"
-        "  cat > /tmp/${SPAWN_ID}_body.md << 'EOF'\n"
-        "  (content)\n"
-        "  EOF\n"
+        "GH BODY RULE: Never use --body with inline text. Use write_file to\n"
+        "create /tmp/${SPAWN_ID}_body.md with the review text, then:\n"
         "  gh pr review NUM --approve --body-file /tmp/${SPAWN_ID}_body.md\n"
+        "NEVER use bash heredocs -- models mangle them into single-line commands.\n"
         "Every response MUST start with: "
         "**Model:** `rescue` **Reasoning:** `high` **Provider:** `rescue`\n"
     )
@@ -869,13 +867,12 @@ def build_prompt(classified: dict, provider: str, model: str,
     lines.append("Work in the repo directory. Use gh CLI for all GitHub API calls.")
     lines.append("")
     lines.append("GH BODY RULE: Never use --body with inline text (double quotes mangle")
-    lines.append("backticks as command substitution). Always use --body-file with a heredoc:")
-    lines.append("  cat > /tmp/${SPAWN_ID}_body.md << 'EOF'")
-    lines.append("  (content here)")
-    lines.append("  EOF")
-    lines.append("  gh pr review NUM --approve --body-file /tmp/${SPAWN_ID}_body.md")
-    lines.append("The single-quoted 'EOF' prevents ALL shell expansion. Use $SPAWN_ID in")
-    lines.append("filenames to avoid collisions if multiple spawns run concurrently.")
+    lines.append("backticks as command substitution). Instead, use the write_file tool")
+    lines.append("to write the review/comment body to a file, then submit with --body-file:")
+    lines.append(f"  1. Use write_file to create /tmp/${{SPAWN_ID}}_body.md with the review text")
+    lines.append(f"  2. Run: gh pr review NUM --approve --body-file /tmp/${{SPAWN_ID}}_body.md")
+    lines.append("NEVER use bash heredocs (cat << 'EOF'). Models often mangle them into")
+    lines.append("single-line commands that timeout. Always use write_file + --body-file.")
     lines.append("")
     lines.append("MDX CONTRIBUTOR ATTRIBUTION RULE:")
     lines.append("When creating or editing MDX documentation files, ALWAYS set the YAML")
@@ -1137,7 +1134,13 @@ def spawn_hermes(prompt: str, provider: str, model: str,
                             if re.search(pattern, stripped):
                                 # Allow retries of failed commands
                                 # (e.g. --approve rejected -> retry with --comment).
-                                if "[error]" in stripped:
+                                # Skip lines that indicate the command was
+                                # blocked, denied, or errored -- these never
+                                # reached the GitHub API and should not count
+                                # as a completed action.
+                                if "[error]" in stripped or "[BLOCKED]" in stripped:
+                                    continue
+                                if "Blocked:" in stripped or "denied" in stripped.lower():
                                     continue
                                 if action_type in completed_actions:
                                     log.error(
