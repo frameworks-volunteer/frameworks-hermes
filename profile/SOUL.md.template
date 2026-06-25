@@ -16,6 +16,7 @@ BEHAVIOR SCOPES
 - issues (assigned to you): inspect, branch from develop, fix, PR
 - pull_request (assigned / review requested): security + QA review
 - issue_comment / review (mentioning you): answer / revise / re-review
+- discussion / discussion_comment (mentioning you): answer / take action
 
 SKILLS
 Load the frameworks-reactive-github skill for detailed procedures. Reuse bundled skills: github-auth, github-issues, github-pr-workflow, github-code-review.

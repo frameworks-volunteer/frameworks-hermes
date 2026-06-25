@@ -154,9 +154,66 @@ work_queue = queue.Queue()
 concurrency_sem = threading.Semaphore(MAX_CONCURRENT)
 active_spawns = {}  # spawn_id -> {thread, start_time, last_output_time, spawn_id}
 
+# Cancellation tracking for unassigned / review-request-removed events
+cancelled_lock = threading.Lock()
+cancelled_work = set()  # keys: ("issue", num) or ("pr", num)
+
+def _work_item_key(item):
+    """Return a cancellation key for a work item, or None."""
+    classified = item.get("classified", {})
+    scope = classified.get("scope", "")
+    if scope == "issue_assigned":
+        return ("issue", classified.get("issue_number"))
+    elif scope in ("pr_assigned", "pr_review_requested"):
+        return ("pr", classified.get("pr_number"))
+    return None
+
+def cancel_pending_work(classified):
+    """Mark work items for a given issue/PR as cancelled and attempt
+    to remove them from the in-memory queue. Returns number removed."""
+    scope = classified.get("scope", "")
+    if scope == "issue_unassigned":
+        key = ("issue", classified.get("issue_number"))
+    elif scope in ("pr_unassigned", "pr_review_request_removed"):
+        key = ("pr", classified.get("pr_number"))
+    else:
+        return 0
+
+    with cancelled_lock:
+        cancelled_work.add(key)
+
+    removed = 0
+    temp = []
+    while True:
+        try:
+            item = work_queue.get_nowait()
+        except queue.Empty:
+            break
+        if _work_item_key(item) == key:
+            removed += 1
+        else:
+            temp.append(item)
+
+    for item in temp:
+        work_queue.put(item)
+
+    log.info("Cancelled %s: removed %d queued item(s)", key, removed)
+    return removed
+
 def enqueue_work(classified, payload, provider, model, reasoning,
                  self_review, sender):
     """Add a work item to the queue. Returns immediately."""
+    key = None
+    scope = classified.get("scope", "")
+    if scope == "issue_assigned":
+        key = ("issue", classified.get("issue_number"))
+    elif scope in ("pr_assigned", "pr_review_requested"):
+        key = ("pr", classified.get("pr_number"))
+
+    if key:
+        with cancelled_lock:
+            cancelled_work.discard(key)
+
     work_queue.put({
         "classified": classified,
         "payload": payload,
@@ -173,6 +230,13 @@ def worker_loop():
         item = work_queue.get()
         if item is None:
             break
+        key = _work_item_key(item)
+        if key:
+            with cancelled_lock:
+                if key in cancelled_work:
+                    log.info("Skipping cancelled work item: %s", key)
+                    work_queue.task_done()
+                    continue
         concurrency_sem.acquire()
         try:
             _process_work_item(item)
@@ -335,12 +399,16 @@ def spawn_rescue(stuck_spawn_id: str, stuck_log_file: str,
 
     log.info("[rescue %s] Spawning rescue agent: %s/%s", rescue_id, prov, mod)
 
+    rescue_toolsets = ("terminal,file,search,web,skills,session_search,todo,"
+                       "delegation,vision,image_gen,code_exec,github")
+
     cmd = [
         HERMES_BIN, "chat",
         "--provider", prov,
         "--model", mod,
         "--skills", "frameworks-reactive-github,github-auth,github-issues,"
                     "github-pr-workflow,github-code-review",
+        "--toolsets", rescue_toolsets,
         "--worktree",
         "--source", "tool",
         "--query", rescue_prompt,
@@ -440,6 +508,15 @@ def classify_event(event_type: str, action: str, payload: dict) -> dict | None:
                     "issue_title": payload.get("issue", {}).get("title", ""),
                     "repo": repo,
                 }
+        if action == "unassigned":
+            assignee = payload.get("assignee", {}) or {}
+            if assignee.get("login", "").lower() == BOT_USERNAME.lower():
+                return {
+                    "scope": "issue_unassigned",
+                    "issue_number": payload.get("issue", {}).get("number"),
+                    "issue_title": payload.get("issue", {}).get("title", ""),
+                    "repo": repo,
+                }
         return None
 
     if event_type == "pull_request":
@@ -454,6 +531,16 @@ def classify_event(event_type: str, action: str, payload: dict) -> dict | None:
                     "pr_author": pr.get("user", {}).get("login", ""),
                     "repo": repo,
                 }
+        if action == "unassigned":
+            assignee = payload.get("assignee", {}) or {}
+            if assignee.get("login", "").lower() == BOT_USERNAME.lower():
+                pr = payload.get("pull_request", {})
+                return {
+                    "scope": "pr_unassigned",
+                    "pr_number": pr.get("number"),
+                    "pr_title": pr.get("title", ""),
+                    "repo": repo,
+                }
         if action == "review_requested":
             reviewer = payload.get("requested_reviewer", {}) or {}
             if reviewer.get("login", "").lower() == BOT_USERNAME.lower():
@@ -463,6 +550,16 @@ def classify_event(event_type: str, action: str, payload: dict) -> dict | None:
                     "pr_number": pr.get("number"),
                     "pr_title": pr.get("title", ""),
                     "pr_author": pr.get("user", {}).get("login", ""),
+                    "repo": repo,
+                }
+        if action == "review_request_removed":
+            reviewer = payload.get("requested_reviewer", {}) or {}
+            if reviewer.get("login", "").lower() == BOT_USERNAME.lower():
+                pr = payload.get("pull_request", {})
+                return {
+                    "scope": "pr_review_request_removed",
+                    "pr_number": pr.get("number"),
+                    "pr_title": pr.get("title", ""),
                     "repo": repo,
                 }
         return None
@@ -523,6 +620,55 @@ def classify_event(event_type: str, action: str, payload: dict) -> dict | None:
         return {
             "scope": "pr_review_comment",
             "pr_number": pr.get("number"),
+            "pr_title": pr.get("title", ""),
+            "comment_body": body,
+            "repo": repo,
+        }
+
+    if event_type == "discussion":
+        # GitHub Discussions fire this for created, edited, answered,
+        # and other actions. We treat them like issue comments: the
+        # bot responds when mentioned or explicitly asked.
+        discussion = payload.get("discussion", {})
+        body = discussion.get("body", "") or ""
+        title = discussion.get("title", "") or ""
+        combined = f"{title} {body}"
+        mentions_bot = f"@{BOT_USERNAME}" in combined
+        explicit_request = any(
+            kw in combined.lower()
+            for kw in ["please fix", "please review", "please look", "take a look",
+                        "can you", "could you", "needs review",
+                        BOT_USERNAME.lower()]
+        )
+        if not (mentions_bot or explicit_request):
+            return None
+        return {
+            "scope": "discussion",
+            "discussion_number": discussion.get("number"),
+            "discussion_title": title,
+            "discussion_body": body,
+            "discussion_category": discussion.get("category", {}).get("name", ""),
+            "repo": repo,
+        }
+
+    if event_type == "discussion_comment":
+        # Comments on a discussion thread. Same trigger logic as
+        # issue comments: mention or explicit request.
+        body = payload.get("comment", {}).get("body", "")
+        mentions_bot = f"@{BOT_USERNAME}" in body
+        explicit_request = any(
+            kw in body.lower()
+            for kw in ["please fix", "please review", "please look", "take a look",
+                        "can you", "could you", "needs review",
+                        BOT_USERNAME.lower()]
+        )
+        if not (mentions_bot or explicit_request):
+            return None
+        discussion = payload.get("discussion", {})
+        return {
+            "scope": "discussion_comment",
+            "discussion_number": discussion.get("number"),
+            "discussion_title": discussion.get("title", ""),
             "comment_body": body,
             "repo": repo,
         }
@@ -550,12 +696,12 @@ def choose_model(classified: dict, payload: dict) -> tuple[str, str, str, str]:
         # Deterministic alternation across self-review models
         pr_num = payload.get("pull_request", {}).get("number", 0)
         provider, model = SELF_REVIEW_MODELS[pr_num % len(SELF_REVIEW_MODELS)]
-        reasoning = "high"
+        reasoning = "medium"
         return provider, model, reasoning, "1"
 
     # Default: primary model from chain
     provider, model = MODEL_CHAIN[0]
-    reasoning = "high"
+    reasoning = "medium"
     return provider, model, reasoning, "0"
 
 # ---------------------------------------------------------------------------
@@ -683,6 +829,38 @@ def build_prompt(classified: dict, provider: str, model: str,
             f"Repo is at: {REPO_PATH}",
             f"Use: gh pr view {num} --repo {ALLOWED_REPO}",
         ]
+    elif scope == "discussion":
+        num = classified.get("discussion_number")
+        lines += [
+            f"Discussion #{num} mentions @{BOT_USERNAME}",
+            f"Title: {classified.get('discussion_title', '')}",
+            f"Category: {classified.get('discussion_category', '')}",
+            "",
+            "Follow Procedure 6 from the skill (treat discussions like issues):",
+            "1. Read the discussion and any prior comments",
+            "2. Answer or take action as appropriate",
+            "3. Include the mandatory prefix",
+            "",
+            f"Discussion body: {classified.get('discussion_body', '')[:500]}",
+            f"Repo is at: {REPO_PATH}",
+            f"Use: gh api repos/{ALLOWED_REPO}/discussions/{num}",
+        ]
+    elif scope == "discussion_comment":
+        num = classified.get("discussion_number")
+        lines += [
+            f"Comment on discussion #{num} mentions @{BOT_USERNAME}",
+            f"Title: {classified.get('discussion_title', '')}",
+            "",
+            "Follow Procedure 6/8 from the skill (treat discussion comments",
+            "like issue/PR comments):",
+            "1. Read the discussion and prior comments",
+            "2. Respond or re-review as appropriate",
+            "3. Include the mandatory prefix",
+            "",
+            f"Comment body: {classified.get('comment_body', '')[:500]}",
+            f"Repo is at: {REPO_PATH}",
+            f"Use: gh api repos/{ALLOWED_REPO}/discussions/{num}",
+        ]
 
     lines.append("")
     lines.append("Every GitHub response MUST start with this line (bold + code):")
@@ -718,6 +896,11 @@ def build_prompt(classified: dict, provider: str, model: str,
     lines.append("    a similar command. Switch to file tools (read_file, search_files).")
     lines.append("  - NEVER run interactive commands that wait for input (nano, vim, less).")
     lines.append("  - NEVER use 'git commit' without '-S' (GPG signing is MANDATORY).")
+    lines.append("  - NEVER use the browser tool. It is disabled. Use web_search or")
+    lines.append("    web_extract for web content instead.")
+    lines.append("  - NEVER use the clarify tool or ask the user questions. You are")
+    lines.append("    running autonomously in a one-shot spawn with no human present.")
+    lines.append("    Make reasonable default decisions and proceed without asking.")
     lines.append("")
     lines.append("When done, exit. Do not wait for further input.")
 
@@ -748,6 +931,12 @@ def spawn_hermes(prompt: str, provider: str, model: str,
     prompt_file.write_text(prompt)
     log.info("Prompt saved: %s", prompt_file.name)
 
+    # Toolsets: explicitly whitelist what the agent can use.
+    # Browser and clarify are EXCLUDED to prevent prompt injection
+    # via web pages and unnecessary waits for user input.
+    toolsets = ("terminal,file,search,web,skills,session_search,todo,"
+                "delegation,vision,image_gen,code_exec,github")
+
     cmd = [
         HERMES_BIN,
         "chat",
@@ -755,6 +944,7 @@ def spawn_hermes(prompt: str, provider: str, model: str,
         "--model", model,
         "--skills", "frameworks-reactive-github,github-auth,github-issues,"
                     "github-pr-workflow,github-code-review",
+        "--toolsets", toolsets,
         "--worktree",
         "--checkpoints",
         "--source", "tool",
@@ -1124,7 +1314,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
         elif event_type == "pull_request":
             sender = payload.get("sender", {}).get("login", "")
         elif event_type in ("issue_comment", "pull_request_review",
-                            "pull_request_review_comment"):
+                            "pull_request_review_comment",
+                            "discussion", "discussion_comment"):
             sender = payload.get("sender", {}).get("login", "")
         elif event_type == "push":
             sender = payload.get("sender", {}).get("login", "")
@@ -1152,6 +1343,19 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"not in scope")
+            return
+
+        # Handle unassignment / review request removal -- cancel queued work
+        if classified["scope"] in (
+            "issue_unassigned", "pr_unassigned", "pr_review_request_removed"
+        ):
+            removed = cancel_pending_work(classified)
+            num = classified.get("issue_number") or classified.get("pr_number")
+            log.info("Processed cancellation: %s #%s (removed %d queued items)",
+                     classified["scope"], num, removed)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(f"cancelled ({removed} items)".encode())
             return
 
         # 9. Choose model
