@@ -61,8 +61,11 @@ Monday at 09:00 UTC-3 to scan for pnpm security advisories and open
 fix PRs automatically.
 
 - Script: `~/.hermes/scripts/check-dependabot.py`
+  (mirrored in `~/repos/frameworks-hermes/scripts/check-dependabot.py`)
 - Schedule: `0 9 * * 1` (Mondays 09:00 UTC-3)
-- Workdir: `~/frameworks`
+- Workdir: `~/frameworks` (script does NOT mutate this checkout)
+- Cron timeout: Hermes no_agent default is 120s — do NOT raise it first;
+  the script is designed to fit under it.
 
 To check if it ran:
 ```
@@ -77,36 +80,45 @@ cronjob run --job-id d81060c39820
 
 Or run the script directly:
 ```bash
-cd ~/frameworks && python3 ~/.hermes/scripts/check-dependabot.py
+python3 ~/.hermes/scripts/check-dependabot.py
 ```
 
-The script workflow:
-1. Checks for existing open PRs from frameworks-volunteer
-2. Runs `npx pnpm audit --json`
-3. If clean (exit 0), exits silently
-4. If vulnerable, writes pnpm overrides to package.json, regenerates
-   pnpm-lock.yaml, commits, pushes, and opens a PR
+Script design (rewritten 2026-08-04 after 14 weeks of consecutive failures):
+1. Fail-fast existing open security-fix PR check (narrow regex /
+   `fix/dependabot-weekly-*` head only — NOT any title containing
+   "dependabot")
+2. Create a throwaway git worktree at `/tmp/fw-dependabot-cron` from
+   `upstream/develop`. NEVER checkout/reset the main working tree or
+   local `develop` (parallel reactive sessions own that tree).
+3. Symlink main-repo `node_modules` into the worktree.
+4. Run `npx pnpm audit --json` in the worktree.
+5. If clean (exit 0), exit silently (watchdog pattern).
+6. If vulnerable, write pnpm overrides, `pnpm install --lockfile-only`,
+   GPG-sign commit, push to origin, open PR, then always tear down the
+   worktree in `finally`.
 
-### Known Bug: False-Positive Duplicate Guard
+Historical failure modes (all fixed by the rewrite):
+- PAT expiry on `git push` (May–early Jul) — credentials now in
+  git-credentials + gh CLI.
+- Dirty main working tree blocked `git checkout develop` (mid–late Jul).
+- Hermes no_agent 120s timeout while audit+install ran on the main tree
+  (Aug 3). Worktree + lockfile-only + node_modules symlink keeps the
+  hot path ~10s for audit alone; full PR path should stay under 120s.
 
-`check-dependabot.py` has a duplicate-avoidance check that is too broad:
+### Dependabot Duplicate Guard
+
+Duplicate detection is intentionally narrow:
 
 ```python
-if "dependabot" in pr.get("title", "").lower():
-    print(f"Existing dependabot PR already open: ...")
-    sys.exit(0)
+SECURITY_PR_RE = re.compile(
+    r"fix\(security\).*dependabot|dependabot.*security",
+    re.IGNORECASE,
+)
+# also matches headRefName startswith "fix/dependabot-weekly-"
 ```
 
-This matches ANY PR with "dependabot" in the title, including
-configuration PRs like `chore(deps): add Dependabot configuration`.
-When such a PR is open, the script skips the audit entirely even if
-there are actual security advisories to fix.
-
-Workaround when manually verifying:
-- Ignore the script's "already open" message if the open PR is a config
-  PR, not a security-fix PR.
-- Run `npx pnpm audit --json` manually to get the ground truth.
-
+Config PRs like `chore(deps): add Dependabot configuration` no longer
+block the weekly security audit.
 ### Dependabot Alerts API Permission
 
 Querying GitHub's Dependabot alerts REST endpoint requires the
@@ -520,6 +532,9 @@ update-safe. Nothing in this setup requires modifying hermes-agent code.
 
   $SPAWN_ID is a unique env var set by the relay per spawn, preventing
   filename collisions when multiple spawns run concurrently.
+
+  See `references/pr-513-heredoc-guard-failure.md` for the full post-mortem
+  of the heredoc + duplicate guard failure that lost a review on PR #513.
 
 ### Work Queue + Concurrency
 
@@ -1165,3 +1180,38 @@ committed, treat it as a critical signal. Possible causes:
 
 Always verify the merged diff against the local commit before declaring
 success. If there is a mismatch, open a follow-up PR immediately.
+
+### NEVER Close and Recreate a PR When You Can Update It
+
+Rule: When a PR needs changes (rebase, new commits, content fixes,
+branch updates), ALWAYS update the existing PR in place. NEVER close it
+and open a new one. This was feedback from mattaereal on PR #544
+(2026-07-06): the agent had closed #543 and opened #544 as a
+replacement simply because the head branch was recreated after
+rebasing onto develop. That was unnecessary -- the PR could have been
+kept open and the branch force-pushed, or the commits amended in
+place.
+
+How to update a PR in place:
+  1. Amend or add commits on the same feature branch.
+  2. Push to origin (force-push if the branch was rebased):
+       git push --force-with-lease origin HEAD
+  3. The existing PR automatically picks up the new commits. No need
+     to close, reopen, or create a new PR.
+  4. If the PR description needs updating, use:
+       gh pr edit <NUM> --repo security-alliance/frameworks --body-file <file>
+
+When closing+recreating MIGHT seem necessary:
+  - Head branch was force-pushed and GitHub refuses to reopen (422):
+    This only applies to CLOSED PRs that need reopening. If the PR is
+    still OPEN, just force-push -- no close/recreate needed at all.
+  - The branch name itself is wrong: rename the branch and push the
+    new name, then update the PR head via the API. Still do NOT close
+    and recreate unless the PR is already closed and cannot be reopened.
+
+The ONLY acceptable reason to close and create a new PR is when the old
+PR is closed AND GitHub returns 422 on reopen attempts AND the branch
+cannot be recovered. In every other case, update in place.
+
+This applies to ALL future PR work. When in doubt: push to the existing
+branch, do not close the PR.
