@@ -4,7 +4,9 @@ Frameworks GitHub Webhook Relay
 
 Receives GitHub webhook deliveries, validates signatures, enforces
 whitelist, classifies events, chooses model, and spawns Hermes in
-one-shot mode.
+one-shot mode with hermes --worktree isolation.
+Up to MAX_CONCURRENT (default 3) agents run in parallel. After bot-fork
+PRs merge, worktrees and head branches are deleted automatically.
 """
 
 import hashlib
@@ -88,6 +90,14 @@ LOG_FILE        = os.environ.get("LOG_FILE", str(Path(__file__).parent / "relay.
 DANGEROUS_CMD_LOG = os.environ.get("DANGEROUS_CMD_LOG", str(Path(__file__).parent / "dangerous_cmds.log"))
 STUCK_TIMEOUT  = int(os.environ.get("STUCK_TIMEOUT", "180"))  # seconds with no output before rescue
 MAX_CONCURRENT  = int(os.environ.get("MAX_CONCURRENT", "3"))  # max parallel Hermes processes
+# Worktree / branch cleanup after bot PRs merge
+WORKTREE_DIR = os.environ.get(
+    "WORKTREE_DIR", str(Path(REPO_PATH) / ".worktrees")
+)
+CLEANUP_ON_MERGE = os.environ.get("CLEANUP_ON_MERGE", "1") not in ("0", "false", "False")
+STALE_WORKTREE_HOURS = int(os.environ.get("STALE_WORKTREE_HOURS", "24"))
+# How often the background reaper wakes (seconds)
+WORKTREE_REAP_INTERVAL = int(os.environ.get("WORKTREE_REAP_INTERVAL", "3600"))
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -199,6 +209,311 @@ def cancel_pending_work(classified):
 
     log.info("Cancelled %s: removed %d queued item(s)", key, removed)
     return removed
+
+
+# ---------------------------------------------------------------------------
+# Worktree + branch cleanup (post-merge + stale reaper)
+# ---------------------------------------------------------------------------
+
+def _run_git(*args, cwd=None, timeout=60) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd or REPO_PATH,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+    )
+
+
+def is_bot_fork_pr(pr: dict) -> bool:
+    """True if PR head lives on the bot fork (safe to delete head branch)."""
+    head = pr.get("head") or {}
+    repo = head.get("repo") or {}
+    full = (repo.get("full_name") or "").lower()
+    login = ((head.get("user") or {}).get("login") or "").lower()
+    bot = BOT_USERNAME.lower()
+    return full == f"{bot}/frameworks" or login == bot
+
+
+def _list_worktrees() -> list[dict]:
+    """Parse `git worktree list --porcelain` into dicts."""
+    r = _run_git("worktree", "list", "--porcelain")
+    if r.returncode != 0:
+        log.warning("worktree list failed: %s", (r.stderr or "").strip()[:200])
+        return []
+    items = []
+    cur = {}
+    for line in (r.stdout or "").splitlines():
+        if not line.strip():
+            if cur.get("path"):
+                items.append(cur)
+            cur = {}
+            continue
+        if line.startswith("worktree "):
+            cur["path"] = line[len("worktree "):]
+        elif line.startswith("branch "):
+            # refs/heads/foo
+            ref = line[len("branch "):]
+            cur["branch"] = ref.split("/", 2)[-1] if ref.startswith("refs/heads/") else ref
+            cur["branch_ref"] = ref
+        elif line.startswith("HEAD "):
+            cur["head"] = line[len("HEAD "):]
+        elif line == "bare":
+            cur["bare"] = True
+        elif line == "detached":
+            cur["detached"] = True
+        elif line == "locked" or line.startswith("locked "):
+            cur["locked"] = True
+            reason = line[len("locked"):].strip()
+            if reason:
+                cur["lock_reason"] = reason
+    if cur.get("path"):
+        items.append(cur)
+    return items
+
+
+
+def _worktree_lock_is_live(wt: dict) -> bool:
+    """True if hermes pid= in lock reason is still running."""
+    if not wt.get("locked"):
+        return False
+    reason = wt.get("lock_reason") or ""
+    m = re.search(r"hermes pid=(\d+)", reason)
+    if not m:
+        return False  # unknown lock — allow reaper after age/unpushed gates
+    pid = int(m.group(1))
+    if pid == os.getpid():
+        return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but not ours — treat live
+
+
+def _remove_worktree(path: str, reason: str = "") -> bool:
+    """Unlock + force-remove a worktree path. Returns True on success."""
+    if not path or path.rstrip("/") == Path(REPO_PATH).as_posix().rstrip("/"):
+        return False
+    p = Path(path)
+    if not p.exists():
+        # Still prune the registration
+        _run_git("worktree", "prune")
+        return True
+    _run_git("worktree", "unlock", path)
+    r = _run_git("worktree", "remove", "--force", path)
+    if r.returncode != 0:
+        # Fallback: manual rm + prune (locked/corrupt trees)
+        log.warning("worktree remove failed (%s): %s — trying rm+prune",
+                    reason, (r.stderr or "").strip()[:200])
+        try:
+            import shutil
+            shutil.rmtree(path, ignore_errors=True)
+        except Exception as e:
+            log.error("rmtree %s failed: %s", path, e)
+            return False
+        _run_git("worktree", "prune")
+    log.info("Removed worktree %s (%s)", path, reason or "cleanup")
+    return True
+
+
+def _delete_local_branch(branch: str) -> bool:
+    if not branch or branch in ("develop", "main", "master"):
+        return False
+    # Never delete the branch currently checked out in primary tree
+    cur = _run_git("rev-parse", "--abbrev-ref", "HEAD")
+    if (cur.stdout or "").strip() == branch:
+        log.info("Skip delete local branch %s (checked out in primary)", branch)
+        return False
+    r = _run_git("branch", "-D", branch)
+    if r.returncode == 0:
+        log.info("Deleted local branch %s", branch)
+        return True
+    log.debug("local branch -D %s: %s", branch, (r.stderr or "").strip()[:160])
+    return False
+
+
+def _delete_remote_branch(branch: str, remote: str = "origin") -> bool:
+    if not branch or branch in ("develop", "main", "master"):
+        return False
+    r = _run_git("push", remote, "--delete", branch, timeout=120)
+    if r.returncode == 0:
+        log.info("Deleted remote %s/%s", remote, branch)
+        return True
+    # already gone is fine
+    err = (r.stderr or "") + (r.stdout or "")
+    if "remote ref does not exist" in err or "does not exist" in err:
+        log.info("Remote %s/%s already gone", remote, branch)
+        return True
+    log.warning("push --delete %s/%s failed: %s", remote, branch, err.strip()[:200])
+    return False
+
+
+def cleanup_worktrees_for_branch(branch: str, reason: str = "") -> int:
+    """Remove any linked worktree that has `branch` checked out."""
+    if not branch:
+        return 0
+    removed = 0
+    for wt in _list_worktrees():
+        if wt.get("branch") == branch and not wt.get("bare"):
+            # skip primary
+            if Path(wt["path"]).resolve() == Path(REPO_PATH).resolve():
+                continue
+            if _remove_worktree(wt["path"], reason=f"branch={branch} {reason}"):
+                removed += 1
+    return removed
+
+
+def cleanup_after_merged_pr(pr: dict) -> dict:
+    """After a bot-fork PR merges: drop worktrees + local/remote head branch.
+
+    Only runs when pr.merged is true (closed-without-merge leaves branches).
+    """
+    stats = {"worktrees": 0, "local_branch": False, "remote_branch": False,
+             "skipped": False, "branch": ""}
+    if not CLEANUP_ON_MERGE:
+        stats["skipped"] = True
+        return stats
+    if not pr.get("merged"):
+        log.info("PR #%s closed without merge — leaving branches",
+                 pr.get("number"))
+        stats["skipped"] = True
+        return stats
+    if not is_bot_fork_pr(pr):
+        log.info("PR #%s head not on bot fork — no cleanup", pr.get("number"))
+        stats["skipped"] = True
+        return stats
+
+    head = pr.get("head") or {}
+    branch = head.get("ref") or ""
+    stats["branch"] = branch
+    num = pr.get("number")
+    log.info("Post-merge cleanup for PR #%s branch=%s", num, branch)
+
+    # 1. Remove worktrees sitting on this branch
+    stats["worktrees"] = cleanup_worktrees_for_branch(
+        branch, reason=f"merged PR #{num}"
+    )
+
+    # 2. Also remove hermes/* session worktrees that still point at this tip
+    #    (agent often commits on fix/* inside a hermes-* worktree path)
+    for wt in _list_worktrees():
+        b = wt.get("branch") or ""
+        path = wt.get("path") or ""
+        if Path(path).resolve() == Path(REPO_PATH).resolve():
+            continue
+        if b == branch or (b.startswith("hermes/") and branch and
+                           branch in path):
+            # extra: if worktree path is under .worktrees and branch is gone
+            # remote-wise, leave to stale reaper unless branch matches
+            pass
+
+    # 3. Delete local + remote feature branch
+    stats["local_branch"] = _delete_local_branch(branch)
+    stats["remote_branch"] = _delete_remote_branch(branch, "origin")
+
+    # 4. Prune worktree metadata
+    _run_git("worktree", "prune")
+    return stats
+
+
+def prune_stale_hermes_worktrees(max_age_hours: int | None = None) -> dict:
+    """Reap old hermes-* session worktrees left behind (crash / unpushed keep).
+
+    Conservative: only removes worktrees under WORKTREE_DIR named hermes-*
+    whose mtime is older than max_age_hours AND have no unique unpushed
+    commits (best-effort). Always unlocks dead locks first.
+    """
+    import time as _time
+    max_age = max_age_hours if max_age_hours is not None else STALE_WORKTREE_HOURS
+    stats = {"removed": 0, "kept": 0, "errors": 0}
+    root = Path(WORKTREE_DIR)
+    if not root.is_dir():
+        return stats
+    now = _time.time()
+    cutoff = now - (max_age * 3600)
+
+    for wt in _list_worktrees():
+        path = wt.get("path") or ""
+        p = Path(path)
+        if not path or p.resolve() == Path(REPO_PATH).resolve():
+            continue
+        try:
+            p.relative_to(root.resolve())
+        except ValueError:
+            continue  # not under our worktree dir
+        name = p.name
+        if not (name.startswith("hermes-") or (wt.get("branch") or "").startswith("hermes/")):
+            # feature worktrees (fix/*) are cleaned on merge, not by age
+            continue
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            mtime = 0
+        if mtime > cutoff:
+            stats["kept"] += 1
+            continue
+
+        # Live hermes session lock — never touch
+        if _worktree_lock_is_live(wt):
+            log.debug("Keeping live-locked worktree %s (%s)", path, wt.get("lock_reason"))
+            stats["kept"] += 1
+            continue
+
+        # Unpushed guard: keep if commits not on any remote
+        chk = _run_git(
+            "rev-list", "--max-count=1", "--not", "--remotes", "HEAD",
+            cwd=path,
+        )
+        has_unpushed = bool((chk.stdout or "").strip()) and chk.returncode == 0
+        if has_unpushed:
+            # Second chance: if every commit is patch-equivalent upstream
+            # (squash-merge case), still safe to drop — use git cherry
+            cherry = _run_git("cherry", "-v", "upstream/develop", "HEAD", cwd=path)
+            # lines starting with "+" are not upstream
+            only_plus = [
+                ln for ln in (cherry.stdout or "").splitlines()
+                if ln.startswith("+")
+            ]
+            if only_plus:
+                log.info("Keeping stale worktree %s (unpushed commits)", path)
+                stats["kept"] += 1
+                continue
+
+        branch = wt.get("branch") or ""
+        if _remove_worktree(path, reason=f"stale>{max_age}h"):
+            stats["removed"] += 1
+            if branch.startswith("hermes/"):
+                _delete_local_branch(branch)
+        else:
+            stats["errors"] += 1
+
+    _run_git("worktree", "prune")
+    # Orphan hermes/* branches with no worktree
+    br = _run_git("for-each-ref", "--format=%(refname:short)", "refs/heads/hermes")
+    live_branches = {wt.get("branch") for wt in _list_worktrees()}
+    for b in (br.stdout or "").splitlines():
+        b = b.strip()
+        if b and b not in live_branches:
+            _delete_local_branch(b)
+    return stats
+
+
+def worktree_reaper_loop():
+    """Background: periodically prune stale hermes session worktrees."""
+    while True:
+        try:
+            time.sleep(WORKTREE_REAP_INTERVAL)
+            stats = prune_stale_hermes_worktrees()
+            if stats.get("removed") or stats.get("errors"):
+                log.info("Worktree reaper: %s", stats)
+        except Exception as e:
+            log.error("Worktree reaper error: %s", e)
+
 
 def enqueue_work(classified, payload, provider, model, reasoning,
                  self_review, sender):
@@ -560,6 +875,19 @@ def classify_event(event_type: str, action: str, payload: dict) -> dict | None:
                     "pr_title": pr.get("title", ""),
                     "repo": repo,
                 }
+        # Merged bot-fork PR → cleanup worktrees + head branch (no Hermes)
+        if action == "closed":
+            pr = payload.get("pull_request", {}) or {}
+            if pr.get("merged") and is_bot_fork_pr(pr):
+                head = pr.get("head") or {}
+                return {
+                    "scope": "pr_merged_cleanup",
+                    "pr_number": pr.get("number"),
+                    "pr_title": pr.get("title", ""),
+                    "pr_branch": head.get("ref", ""),
+                    "pr_merged": True,
+                    "repo": repo,
+                }
         return None
 
     if event_type == "issue_comment":
@@ -728,6 +1056,21 @@ def build_prompt(classified: dict, provider: str, model: str,
         f"  - Use: gh pr create --repo security-alliance/frameworks --head {BOT_USERNAME}:BRANCH",
         "  - ALL COMMITS MUST BE GPG-SIGNED: always use git commit -S",
         "",
+        "WORKTREE / PARALLEL ISOLATION:",
+        "  - This session was started with hermes --worktree. You are already in an",
+        f"    isolated git worktree under {WORKTREE_DIR}/hermes-*.",
+        "  - Do ALL file edits and commits inside the current worktree cwd.",
+        f"  - NEVER mutate the primary checkout at {REPO_PATH} (other parallel agents",
+        "    share it). Do not git checkout/pull/reset there.",
+        "  - Create feature branches FROM upstream/develop inside this worktree:",
+        "      git fetch upstream",
+        "      git checkout -B fix/issue-N-slug upstream/develop",
+        "    (or chore/... as appropriate). Prefer -B so a leftover local branch is reset.",
+        "  - Up to 3 agents run in parallel (relay MAX_CONCURRENT). Stay in your tree.",
+        "  - After your PR merges, the relay deletes the head branch + any worktree on it.",
+        "    You do NOT need to delete the hermes-* session worktree yourself.",
+        "  - NEVER leave the primary tree dirty. NEVER create branches on develop/main.",
+        "",
     ]
 
     if self_review == "1":
@@ -742,15 +1085,17 @@ def build_prompt(classified: dict, provider: str, model: str,
             f"Issue #{num} was assigned to you: {classified.get('issue_title', '')}",
             "",
             "Follow Procedure 1 from the skill:",
-            "1. Inspect the issue and repo context",
-            "2. Create a branch from develop",
+            "1. Inspect the issue and repo context (stay in current worktree cwd)",
+            "2. Create feature branch from upstream/develop IN THIS WORKTREE:",
+            "     git fetch upstream && git checkout -B fix/issue-<N>-<slug> upstream/develop",
             "3. Implement the fix",
             "4. Quick checks only (lint/syntax, NOT full builds)",
             "5. GPG-SIGN your commit (git commit -S, ALWAYS)",
-            "6. Push to fork (origin), create PR to upstream",
+            "6. Push to fork (origin), create PR to upstream develop",
             "7. Leave a concise status comment",
             "",
-            f"Repo is at: {REPO_PATH}",
+            f"Primary repo path (DO NOT edit): {REPO_PATH}",
+            f"Your cwd is already a hermes worktree under {WORKTREE_DIR}/ — work here.",
             f"Use: gh issue view {num} --repo {ALLOWED_REPO}",
         ]
     elif scope in ("pr_assigned", "pr_review_requested"):
@@ -1330,8 +1675,23 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"self-event")
             return
 
-        # 7. Enforce whitelist
+        # 7. Enforce whitelist (exception: merged bot-fork PR cleanup)
+        action = payload.get("action", "")
         if sender and sender.lower() not in ALLOWED_SENDERS:
+            # Allow post-merge cleanup of our own fork heads regardless of
+            # who clicked Merge (maintainers may not be on ALLOWED_SENDERS).
+            if event_type == "pull_request" and action == "closed":
+                pr = payload.get("pull_request", {}) or {}
+                if pr.get("merged") and is_bot_fork_pr(pr):
+                    stats = cleanup_after_merged_pr(pr)
+                    log.info(
+                        "pr_merged_cleanup (non-whitelist merger=%s) PR #%s stats=%s",
+                        sender, pr.get("number"), stats,
+                    )
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"cleaned (non-whitelist merger)")
+                    return
             log.info("Sender %s not in whitelist -- ignoring", sender)
             self.send_response(200)
             self.end_headers()
@@ -1339,7 +1699,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
             return
 
         # 8. Classify
-        action = payload.get("action", "")
         classified = classify_event(event_type, action, payload)
         if classified is None:
             log.info("Event %s/%s not in scope -- ignoring", event_type, action)
@@ -1361,6 +1720,24 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.wfile.write(f"cancelled ({removed} items)".encode())
             return
 
+        # Merged bot PR: delete worktree(s) + local/remote head branch.
+        # No Hermes spawn. Runs for any merger (whitelist already passed OR
+        # we re-check bot head so a non-whitelist merge still cleans up —
+        # see early path below if whitelist blocked).
+        if classified["scope"] == "pr_merged_cleanup":
+            pr = payload.get("pull_request", {}) or {}
+            stats = cleanup_after_merged_pr(pr)
+            log.info("pr_merged_cleanup PR #%s branch=%s stats=%s",
+                     classified.get("pr_number"), stats.get("branch"), stats)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(
+                f"cleaned worktrees={stats.get('worktrees')} "
+                f"local={stats.get('local_branch')} "
+                f"remote={stats.get('remote_branch')}".encode()
+            )
+            return
+
         # 9. Choose model
         provider, model, reasoning, self_review = choose_model(classified, payload)
 
@@ -1380,8 +1757,13 @@ class WebhookHandler(BaseHTTPRequestHandler):
             log.warning("Queue depth %d -- high load", queue_depth)
         enqueue_work(classified, payload, provider, model,
                     reasoning, self_review, sender)
-        log.info("Enqueued: scope=%s (queue depth: %d)",
-                 classified["scope"], queue_depth + 1)
+        # Rough busy count: how many semaphore slots free
+        try:
+            busy = MAX_CONCURRENT - concurrency_sem._value  # noqa: SLF001
+        except Exception:
+            busy = "?"
+        log.info("Enqueued: scope=%s (queue depth: %d, busy slots: %s/%d)",
+                 classified["scope"], queue_depth + 1, busy, MAX_CONCURRENT)
 
     def log_message(self, fmt, *args):
         # Suppress default access log, we use our own
@@ -1395,10 +1777,22 @@ def main():
     init_db()
     # Prune old delivery IDs on startup
     prune_db()
+    # Reap leftover hermes session worktrees from prior crashes
+    try:
+        stats = prune_stale_hermes_worktrees()
+        log.info("Startup worktree prune: %s", stats)
+    except Exception as e:
+        log.warning("Startup worktree prune failed: %s", e)
+    # Background reaper (hourly by default)
+    threading.Thread(target=worktree_reaper_loop, daemon=True).start()
     server = HTTPServer(("127.0.0.1", RELAY_PORT), WebhookHandler)
     log.info("Relay listening on 127.0.0.1:%d", RELAY_PORT)
     log.info("Repo: %s  Bot: %s  Whitelist: %s",
              ALLOWED_REPO, BOT_USERNAME, ALLOWED_SENDERS)
+    log.info("Parallelism: MAX_CONCURRENT=%d (each spawn uses hermes --worktree)",
+             MAX_CONCURRENT)
+    log.info("Worktrees: dir=%s cleanup_on_merge=%s stale_hours=%d",
+             WORKTREE_DIR, CLEANUP_ON_MERGE, STALE_WORKTREE_HOURS)
     log.info("Model chain: %s",
              " -> ".join(f"{p}/{m}" for p, m in MODEL_CHAIN))
     if SELF_REVIEW_MODELS:
