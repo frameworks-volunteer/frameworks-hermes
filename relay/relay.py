@@ -1025,12 +1025,12 @@ def choose_model(classified: dict, payload: dict) -> tuple[str, str, str, str]:
         # Deterministic alternation across self-review models
         pr_num = payload.get("pull_request", {}).get("number", 0)
         provider, model = SELF_REVIEW_MODELS[pr_num % len(SELF_REVIEW_MODELS)]
-        reasoning = "medium"
+        reasoning = "high"
         return provider, model, reasoning, "1"
 
-    # Default: primary model from chain
+    # Default: primary model from chain (grok-4.5 high for GitHub work)
     provider, model = MODEL_CHAIN[0]
-    reasoning = "medium"
+    reasoning = "high"
     return provider, model, reasoning, "0"
 
 # ---------------------------------------------------------------------------
