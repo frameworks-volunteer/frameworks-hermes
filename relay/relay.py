@@ -720,7 +720,10 @@ def spawn_rescue(stuck_spawn_id: str, stuck_log_file: str,
         "--provider", prov,
         "--model", mod,
         "--skills", "frameworks-reactive-github,github-auth,github-issues,"
-                    "github-pr-workflow,github-code-review",
+                    "github-pr-workflow,github-code-review,"
+                    "caveman,rtk,superpowers,using-superpowers,"
+                    "using-git-worktrees,dispatching-parallel-agents,"
+                    "verification-before-completion",
         "--toolsets", rescue_toolsets,
         "--worktree",
         "--source", "tool",
@@ -1285,7 +1288,10 @@ def spawn_hermes(prompt: str, provider: str, model: str,
         "--provider", provider,
         "--model", model,
         "--skills", "frameworks-reactive-github,github-auth,github-issues,"
-                    "github-pr-workflow,github-code-review",
+                    "github-pr-workflow,github-code-review,"
+                    "caveman,rtk,superpowers,using-superpowers,"
+                    "using-git-worktrees,dispatching-parallel-agents,"
+                    "verification-before-completion",
         "--toolsets", toolsets,
         "--worktree",
         "--checkpoints",
