@@ -595,7 +595,8 @@ def _process_work_item(item):
                      classified["scope"], prov, mod)
             return
         elif result is None:
-            log.warning("Rate limited on %s/%s, trying fallback",
+            log.warning("Retryable failure on %s/%s "
+                        "(rate-limit or incomplete workflow), trying fallback",
                         prov, mod)
             continue
         else:
@@ -1014,6 +1015,10 @@ def choose_model(classified: dict, payload: dict) -> tuple[str, str, str, str]:
     If self-review (PR authored by bot), picks from SELF_REVIEW_MODELS.
     Otherwise picks the primary model from MODEL_CHAIN (fallback happens
     in _run_with_fallback, not here).
+
+    Reasoning is medium by default. grok-4.5 + high repeatedly hit
+    finish_reason=length mid-tool-call on PR #616 (2026-08-30), exited 0,
+    and left work incomplete with no fallback.
     """
     is_self_review = (
         classified["scope"] == "pr_review_requested"
@@ -1025,12 +1030,12 @@ def choose_model(classified: dict, payload: dict) -> tuple[str, str, str, str]:
         # Deterministic alternation across self-review models
         pr_num = payload.get("pull_request", {}).get("number", 0)
         provider, model = SELF_REVIEW_MODELS[pr_num % len(SELF_REVIEW_MODELS)]
-        reasoning = "high"
+        reasoning = "medium"
         return provider, model, reasoning, "1"
 
-    # Default: primary model from chain (grok-4.5 high for GitHub work)
+    # Default: primary model from chain at medium reasoning
     provider, model = MODEL_CHAIN[0]
-    reasoning = "high"
+    reasoning = "medium"
     return provider, model, reasoning, "0"
 
 # ---------------------------------------------------------------------------
@@ -1252,12 +1257,210 @@ def build_prompt(classified: dict, provider: str, model: str,
     return "\n".join(lines)
 
 # ---------------------------------------------------------------------------
+# Post-exit incomplete workflow detection
+# ---------------------------------------------------------------------------
+
+# Scopes that must produce a GitHub review or comment to count as done.
+_REVIEW_SCOPES = frozenset({
+    "pr_assigned", "pr_review_requested",
+})
+_COMMENT_SCOPES = frozenset({
+    "pr_comment", "issue_comment", "pr_review", "pr_review_comment",
+    "discussion", "discussion_comment",
+})
+_ISSUE_FIX_SCOPES = frozenset({
+    "issue_assigned",
+})
+
+# Output patterns that mean Hermes aborted without finishing the task.
+_TRUNCATION_MARKERS = (
+    "finish_reason='length'",
+    'finish_reason="length"',
+    "Response truncated due to output length limit",
+    "Truncated tool call response detected again",
+    "refusing to execute incomplete tool arguments",
+)
+
+
+def _detect_incomplete_workflow(
+    scope: str,
+    output_text: str,
+    completed_actions: set,
+    worktree_dir: str,
+) -> list[str]:
+    """Return human-readable reasons the spawn looks incomplete, or [].
+
+    Hermes can exit 0 while the workflow is unfinished (PR #616, 2026-08-30):
+    output-length truncation loops, unpushed commits left in the worktree,
+    or a required review/comment never submitted. Callers treat a non-empty
+    result as retryable (return None from spawn_hermes → MODEL_CHAIN fallback).
+    """
+    reasons: list[str] = []
+
+    # 1. Output-length truncation / aborted tool-call loops
+    trunc_hits = [m for m in _TRUNCATION_MARKERS if m in output_text]
+    if trunc_hits:
+        reasons.append(
+            "output truncated/aborted mid-tool-call (%s)"
+            % trunc_hits[0]
+        )
+
+    # 2. Unpushed commits left in THIS spawn's worktree only.
+    # Hermes logs either:
+    #   "Worktree created: /path/.worktrees/hermes-XXXX"
+    #   "Worktree has unpushed commits, keeping: /path/..."
+    # Only inspect the path from THIS output — scanning every hermes-*
+    # tree would false-positive on leftover trees from parallel/prior
+    # spawns and poison the fallback attempt.
+    try:
+        wt_paths: list[Path] = []
+        for m in re.finditer(
+            r"Worktree (?:created|has unpushed commits, keeping):\s*"
+            r"(\S+/hermes-[0-9a-f]+)",
+            output_text,
+        ):
+            p = Path(m.group(1))
+            # Prefer paths under the configured worktree dir when set
+            if worktree_dir:
+                try:
+                    p.resolve().relative_to(Path(worktree_dir).resolve())
+                except (ValueError, OSError):
+                    # still accept — hermes may log absolute paths we want
+                    pass
+            if p not in wt_paths:
+                wt_paths.append(p)
+        # Also honor Hermes' own unpushed-keep warning even if path parse fails
+        hermes_kept_unpushed = (
+            "Worktree has unpushed commits, keeping" in output_text
+        )
+        if hermes_kept_unpushed and not wt_paths:
+            reasons.append(
+                "hermes reported unpushed commits kept in worktree"
+            )
+        for wt_path in wt_paths:
+            if not wt_path.is_dir():
+                # hermes already said it kept unpushed commits
+                if hermes_kept_unpushed:
+                    reasons.append(
+                        "unpushed commits kept in worktree %s (path gone)"
+                        % wt_path.name
+                    )
+                continue
+            chk = _run_git(
+                "status", "--porcelain", "--branch",
+                cwd=str(wt_path), timeout=15,
+            )
+            if chk.returncode != 0:
+                continue
+            status_out = chk.stdout or ""
+            branch_line = ""
+            for ln in status_out.splitlines():
+                if ln.startswith("##"):
+                    branch_line = ln
+                    break
+            if "ahead" in branch_line or hermes_kept_unpushed:
+                reasons.append(
+                    "unpushed commits in worktree %s (%s)"
+                    % (wt_path.name, branch_line.strip() or "kept by hermes")
+                )
+                continue
+            # Fallback: rev-list against upstream if tracking is set
+            ahead_chk = _run_git(
+                "rev-list", "--count", "@{u}..HEAD",
+                cwd=str(wt_path), timeout=15,
+            )
+            if (
+                ahead_chk.returncode == 0
+                and (ahead_chk.stdout or "").strip() not in ("", "0")
+            ):
+                reasons.append(
+                    "unpushed commits in worktree %s (rev-list %s)"
+                    % (wt_path.name, (ahead_chk.stdout or "").strip())
+                )
+    except Exception as e:
+        log.debug("incomplete-check worktree scan failed: %s", e)
+
+    # 3. Scope-required GitHub action never submitted
+    # completed_actions is populated by the PTY guard when it sees a real
+    # `gh pr review N` / `gh pr comment N` / `gh issue comment N` line.
+    if scope in _REVIEW_SCOPES:
+        if "review" not in completed_actions and "pr_comment" not in completed_actions:
+            # Also accept successful API evidence in the log (race with kill)
+            if not re.search(
+                r"(Submitted|approved|requested changes|commented|"
+                r"gh pr review.*successfully|Review submitted)",
+                output_text,
+                re.IGNORECASE,
+            ):
+                reasons.append(
+                    "scope %s requires a PR review/comment but none was submitted"
+                    % scope
+                )
+    elif scope in _COMMENT_SCOPES:
+        if "pr_comment" not in completed_actions and "issue_comment" not in completed_actions:
+            if not re.search(
+                r"(gh (?:pr|issue) comment.*successfully|"
+                r"https://github\.com/.+/pull/\d+#issuecomment-|"
+                r"https://github\.com/.+/issues/\d+#issuecomment-|"
+                r"Comment created|commented on)",
+                output_text,
+                re.IGNORECASE,
+            ):
+                reasons.append(
+                    "scope %s requires a comment but none was submitted"
+                    % scope
+                )
+    elif scope in _ISSUE_FIX_SCOPES:
+        # issue_assigned should produce a PR (or at least a status comment).
+        # Detect either a successful `gh pr create` or an issue comment.
+        has_pr = bool(re.search(
+            r"(gh pr create.*https://github\.com/.+/pull/\d+|"
+            r"https://github\.com/.+/pull/\d+|"
+            r"pull request created|Created pull request)",
+            output_text,
+            re.IGNORECASE,
+        ))
+        has_comment = (
+            "issue_comment" in completed_actions
+            or bool(re.search(
+                r"(gh issue comment.*successfully|"
+                r"https://github\.com/.+/issues/\d+#issuecomment-)",
+                output_text,
+                re.IGNORECASE,
+            ))
+        )
+        if not has_pr and not has_comment:
+            # Only flag if the agent actually started work (tools ran) —
+            # empty/near-empty spawns are caught by truncation above.
+            if "git " in output_text or "gh " in output_text:
+                reasons.append(
+                    "scope %s produced neither a PR nor a status comment"
+                    % scope
+                )
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique = []
+    for r in reasons:
+        if r not in seen:
+            seen.add(r)
+            unique.append(r)
+    return unique
+
+
+# ---------------------------------------------------------------------------
 # Hermes spawner
 # ---------------------------------------------------------------------------
 
 def spawn_hermes(prompt: str, provider: str, model: str,
-                 scope: str = "") -> bool:
+                 scope: str = "") -> bool | None:
     """Spawn Hermes in one-shot mode and wait for it to finish.
+
+    Returns:
+      True  -- success (workflow complete)
+      None  -- retryable failure (rate-limit OR incomplete workflow);
+               caller should try the next model in MODEL_CHAIN
+      False -- fatal failure (do not retry)
 
     Writes the prompt and full Hermes output to per-spawn files under
     spawns/ so you can inspect what happened. Logs key events (tool
@@ -1590,6 +1793,25 @@ def spawn_hermes(prompt: str, provider: str, model: str,
             log.warning("[spawn %s] RATE LIMITED (exit %d) session=%s -- "
                         "will try fallback",
                         spawn_id, proc.returncode, session_id)
+            return None  # None = retry with next model
+
+        # Post-exit incomplete-workflow detection (PR #616 lesson).
+        # Hermes can exit 0 while the task is unfinished: output-length
+        # truncation loops, unpushed commits left in the worktree, or a
+        # review/comment never submitted. Treat these as retryable so
+        # MODEL_CHAIN falls through instead of logging false "Completed".
+        incomplete_reasons = _detect_incomplete_workflow(
+            scope=scope,
+            output_text=output_text,
+            completed_actions=completed_actions,
+            worktree_dir=WORKTREE_DIR,
+        )
+        if incomplete_reasons:
+            for reason in incomplete_reasons:
+                log.warning("[spawn %s] INCOMPLETE: %s", spawn_id, reason)
+            log.warning("[spawn %s] exit=%d but workflow incomplete -- "
+                        "will try fallback (session=%s tools=%d)",
+                        spawn_id, proc.returncode, session_id, tool_count)
             return None  # None = retry with next model
 
         log.info("[spawn %s] Done: exit=%d session=%s "

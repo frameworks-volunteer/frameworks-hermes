@@ -343,26 +343,33 @@ Steps:
 ## Model Fallback Chain
 
 The relay tries models sequentially from MODEL_CHAIN in config.env.
-If a model returns a rate-limit error (429), the relay automatically
-retries with the next model in the chain. Fatal errors (auth failure,
-module crash) stop the chain immediately -- no retry.
+Retryable failures (rate-limit 429 OR incomplete workflow) advance to
+the next model. Fatal errors (auth failure, module crash) stop the
+chain immediately -- no retry.
+
+Reasoning level is **medium** for all scopes (choose_model). grok-4.5
++ high hit finish_reason=length mid-tool-call on PR #616 (2026-08-30)
+and exited 0 with work unfinished; medium avoids that token blowout.
 
 Current chain:
-  1. openrouter/z-ai/glm-5.2 (primary, cheapest/good-enough)
-  2. openrouter/moonshotai/kimi-k2.6 (fallback 1)
-  3. openrouter/deepseek/deepseek-v4-flash (fallback 2)
+  1. openrouter/x-ai/grok-4.5 (primary, medium reasoning)
+  2. openrouter/z-ai/glm-5.2 (fallback 1)
+  3. openrouter/moonshotai/kimi-k2.6 (fallback 2)
+  4. openrouter/deepseek/deepseek-v4-flash (fallback 3)
 
 Self-review PRs use a separate chain (SELF_REVIEW_MODELS) to avoid
 the bot reviewing its own work with the same model that wrote it.
-Current self-review chain:
+Current self-review chain (also medium reasoning):
   1. openrouter/moonshotai/kimi-k2.6
   2. openrouter/deepseek/deepseek-v4-flash
 
 Log pattern when fallback triggers:
-  Processing: ... model=z-ai/glm-5.2 (attempt 1/3)
-  [spawn ...] RATE LIMITED ... -- will try fallback
-  Processing: ... model=moonshotai/kimi-k2.6 (attempt 2/3)
-  Completed: ... (model=openrouter/moonshotai/kimi-k2.6)
+  Processing: ... model=x-ai/grok-4.5 (attempt 1/4)
+  [spawn ...] INCOMPLETE: output truncated/aborted mid-tool-call ...
+  [spawn ...] exit=0 but workflow incomplete -- will try fallback
+  Retryable failure on openrouter/x-ai/grok-4.5 (rate-limit or incomplete workflow), trying fallback
+  Processing: ... model=z-ai/glm-5.2 (attempt 2/4)
+  Completed: ... (model=openrouter/z-ai/glm-5.2)
 
 To change the chain, edit MODEL_CHAIN in config.env and restart
 the relay. Comma-separated, provider/model format.
@@ -421,8 +428,9 @@ update-safe. Nothing in this setup requires modifying hermes-agent code.
   ALLOWED_REPO=security-alliance/frameworks
   BOT_USERNAME=frameworks-volunteer
   ALLOWED_SENDERS=scode2277,mattaereal
-  MODEL_CHAIN=openrouter/z-ai/glm-5.2,openrouter/moonshotai/kimi-k2.6,openrouter/deepseek/deepseek-v4-flash
+  MODEL_CHAIN=openrouter/x-ai/grok-4.5,openrouter/z-ai/glm-5.2,openrouter/moonshotai/kimi-k2.6,openrouter/deepseek/deepseek-v4-flash
   SELF_REVIEW_MODELS=openrouter/moonshotai/kimi-k2.6,openrouter/deepseek/deepseek-v4-flash
+  Reasoning: medium for all scopes (choose_model) -- do NOT use high with grok-4.5
   STUCK_TIMEOUT=180       -- seconds with no output before rescue agent spawns
   MAX_CONCURRENT=3        -- max parallel Hermes processes
   PAT: classic (ghp_), scopes: repo, read:org, workflow
@@ -463,6 +471,9 @@ update-safe. Nothing in this setup requires modifying hermes-agent code.
     --max-turns 90
 
   FLAGS:
+  --worktree  REQUIRED for parallel spawns. Hermes creates
+              $REPO_PATH/.worktrees/hermes-<id> and cds into it.
+              Agent must stay there; never edit primary REPO_PATH.
   --toolsets  EXCLUDES browser and clarify. Browser is disabled to
               prevent prompt injection via web pages. Clarify is
               disabled because the agent runs autonomously with no
@@ -536,24 +547,58 @@ update-safe. Nothing in this setup requires modifying hermes-agent code.
   See `references/pr-513-heredoc-guard-failure.md` for the full post-mortem
   of the heredoc + duplicate guard failure that lost a review on PR #513.
 
-### Work Queue + Concurrency
+### Work Queue + Concurrency (parallel worktrees)
 
   Webhooks are NOT processed immediately. The HTTP handler enqueues
   work items and returns 202. Worker threads (MAX_CONCURRENT=3) pull
-  from the queue and spawn Hermes one at a time per slot.
+  from the queue and spawn Hermes — up to 3 in true parallel.
+
+  Each spawn uses `hermes chat --worktree`, so Hermes creates an
+  isolated tree at `$REPO_PATH/.worktrees/hermes-<id>` on branch
+  `hermes/hermes-<id>` before the agent runs. Agents must:
+    - Stay inside that worktree cwd for all edits/commits
+    - Create feature branches from `upstream/develop` inside it
+      (`git fetch upstream && git checkout -B fix/... upstream/develop`)
+    - NEVER mutate the primary checkout at REPO_PATH
 
   This prevents:
-    - 7 parallel Hermes processes fighting for CPU/API quota
-    - Cascade 429 rate limits from burst events
+    - Parallel agents clobbering the same working tree
+    - Cascade 429 rate limits from unbounded burst spawns
     - Resource exhaustion on the machine
 
-  Config:
-    MAX_CONCURRENT=3    -- max parallel Hermes processes (config.env)
-    STUCK_TIMEOUT=180   -- seconds with no output before rescue (config.env)
+  Config (config.env):
+    MAX_CONCURRENT=3           -- max parallel Hermes processes
+    STUCK_TIMEOUT=180          -- seconds with no output before rescue
+    WORKTREE_DIR=.../.worktrees
+    CLEANUP_ON_MERGE=1         -- delete branch+worktree after bot PR merges
+    STALE_WORKTREE_HOURS=24    -- reap leftover hermes-* session trees
+    WORKTREE_REAP_INTERVAL=3600
 
   Queue depth is logged on enqueue:
-    Enqueued: scope=issue_assigned (queue depth: 2)
+    Enqueued: scope=issue_assigned (queue depth: 2, busy slots: 1/3)
     If depth >= 10, a warning is logged.
+
+### Post-merge worktree + branch cleanup
+
+  When a PR whose head lives on the bot fork (`frameworks-volunteer/...`)
+  is merged (pull_request action=closed, merged=true):
+
+    1. Relay classifies as `pr_merged_cleanup` (no Hermes spawn)
+    2. Removes any linked worktree checked out on the head branch
+    3. Deletes local head branch (`git branch -D`)
+    4. Deletes origin head branch (`git push origin --delete`)
+    5. `git worktree prune`
+
+  Runs even if the merger is NOT on ALLOWED_SENDERS (maintainers merge).
+  Closed-without-merge leaves branches alone (may still be needed).
+  Non-bot-fork PRs are ignored.
+
+  Additionally, a background reaper (hourly) drops stale `hermes-*`
+  session worktrees older than STALE_WORKTREE_HOURS when they have no
+  unique unpushed commits (squash-merged commits count as merged via
+  `git cherry`). Orphan `hermes/*` local branches without a worktree
+  are deleted. Feature branches (`fix/*`, `chore/*`) are only removed
+  on merge cleanup, not by age.
 
 ### Cancellation (Unassignment / Review Request Removal)
 
@@ -705,41 +750,48 @@ NEVER let the agent create test commits. The prompt prohibition
 prevents this, but if one already exists, clean it manually before
 any new PR work.
 
-### Post-Exit Incomplete Workflow Detection
+### Post-Exit Incomplete Workflow Detection (IMPLEMENTED 2026-08-30)
 
-Hermes can exit 0 while the workflow is INCOMPLETE. Common pattern:
-- Agent creates branch, edits files, commits with GPG signing
-- Model goes silent (empty responses for 3 retries)
-- Hermes exits 0
-- Relay sees exit=0 and considers it success
-- Branch sits unpushed, PR never created, issue never commented
+Hermes can exit 0 while the workflow is INCOMPLETE. Historical pattern
+(PR #616, 2026-08-30):
+- Agent patches files, GPG-commits, then hits finish_reason=length
+- Hermes retries truncated tool calls 4x, then aborts
+- Exit 0 -- relay used to log "Completed" and skip MODEL_CHAIN fallback
+- Commit sat unpushed in hermes-* worktree; no PR comment posted
 
-The relay should verify after exit=0:
-  1. Check if the branch has unpushed commits (git log origin/branch..branch)
-  2. Check if a PR exists for the branch
-  3. If commits exist but no PR, the relay should finish the workflow
-     (push + PR create + issue comment) rather than declaring success
+The relay now runs `_detect_incomplete_workflow()` after every spawn
+that is not fatal/rate-limited. Non-empty reasons → return None
+(retryable) so MODEL_CHAIN falls through. Checks:
 
-This is a known gap. The current workaround: manual intervention when
-you see "Done: exit=0" but no PR link in the relay log.
+  1. Output-length truncation markers:
+       finish_reason='length'
+       Response truncated due to output length limit
+       Truncated tool call response detected again
+       refusing to execute incomplete tool arguments
+  2. Unpushed commits in THIS spawn's worktree only (path parsed from
+     Hermes "Worktree created:" / "Worktree has unpushed commits, keeping:"
+     lines -- does NOT scan sibling hermes-* trees)
+  3. Scope-required GitHub action missing:
+       pr_assigned / pr_review_requested → need review or pr_comment
+       pr_comment / issue_comment / pr_review* / discussion* → need comment
+       issue_assigned → need PR create evidence OR status comment
 
-A SECOND variant: the agent completes the analysis (e.g. a full PR
-review) but the final `gh pr review` / `gh pr comment` call fails with
-HTTP 401 (expired PAT) or HTTP 403 (insufficient permissions). The
-relay logs "Completed: pr_review_requested" and exits 0 because Hermes
-itself did not crash -- the GitHub API rejection is an operational
-error, not a process failure. The relay's crash detection looks for
-"API key was rejected", "Traceback", "ModuleNotFoundError" -- none of
-which match a 401/403. So the relay considers the spawn successful and
-does not retry with a fallback model.
+Log pattern on incomplete:
+  [spawn ...] INCOMPLETE: output truncated/aborted mid-tool-call (...)
+  [spawn ...] INCOMPLETE: unpushed commits in worktree hermes-XXXX (...)
+  [spawn ...] exit=0 but workflow incomplete -- will try fallback
+  Retryable failure on openrouter/x-ai/grok-4.5 (...), trying fallback
 
-Detection: after a "Completed:" log line for a review scope, check:
+Remaining gap (NOT covered by incomplete detection): the agent finishes
+analysis but the final `gh pr review` / `gh pr comment` fails with
+HTTP 401 (expired PAT) or HTTP 403. The PTY guard may still mark the
+action as "completed" because the command line was seen. Manual check:
   gh api repos/security-alliance/frameworks/pulls/NUM/reviews \
     --jq '[.[] | select(.user.login=="frameworks-volunteer")] | length'
-If the count is 0, the review was not posted. Search the spawn output
-log for "401" or "PAT expired" to confirm the cause.
+If 0, search spawn output for "401" / "PAT expired".
 
 Recovery: see `references/pat-expiry-missed-reviews.md`.
+Also see PR #616 lesson: prefer medium reasoning with grok-4.5.
 
 1. NEVER pass read_file() output directly to write_file() -- read_file
    prepends "N|" line numbers which get baked into the file. Always

@@ -1,12 +1,12 @@
 # Frameworks Reactive Agent -- Status
 
-Last updated: 2026-06-25
+Last updated: 2026-08-30
 
 ## Infrastructure
 
 | Component         | Status  | Notes                                           |
 |-------------------|---------|-------------------------------------------------|
-| Relay service     | RUNNING | systemd user service, uptime 11+ days           |
+| Relay service     | RUNNING | needs restart after 2026-08-30 incomplete-workflow change |
 | Cloudflare tunnel  | RUNNING | Token-based, remotely managed                   |
 | Relay filter tests| PASS     | ping, wrong-repo, whitelist, self-event         |
 | GitHub PAT        | VALID   | Classic (ghp_), scopes: repo, workflow, read:org |
@@ -14,14 +14,27 @@ Last updated: 2026-06-25
 
 ## Model Configuration
 
-Primary chain (MODEL_CHAIN):
-  1. openrouter/z-ai/glm-5.2 (primary)
-  2. openrouter/moonshotai/kimi-k2.6 (fallback 1)
-  3. openrouter/deepseek/deepseek-v4-flash (fallback 2)
+Primary chain (MODEL_CHAIN), reasoning=medium for ALL scopes:
+  1. openrouter/x-ai/grok-4.5 (primary)
+  2. openrouter/z-ai/glm-5.2 (fallback 1)
+  3. openrouter/moonshotai/kimi-k2.6 (fallback 2)
+  4. openrouter/deepseek/deepseek-v4-flash (fallback 3)
 
-Self-review chain (SELF_REVIEW_MODELS):
+Self-review chain (SELF_REVIEW_MODELS), also medium:
   1. openrouter/moonshotai/kimi-k2.6
   2. openrouter/deepseek/deepseek-v4-flash
+
+DO NOT use reasoning=high with grok-4.5. PR #616 (2026-08-30) hit
+finish_reason=length mid-tool-call, exited 0, left unpushed commits.
+
+## Post-exit incomplete workflow detection (2026-08-30)
+
+After every non-fatal spawn, `_detect_incomplete_workflow()` checks:
+  1. Output truncation markers (finish_reason=length, etc.)
+  2. Unpushed commits in THIS spawn's worktree only
+  3. Missing scope-required GitHub action (review/comment/PR)
+
+Non-empty reasons → return None → MODEL_CHAIN fallback (same path as 429).
 
 ## Toolset Configuration
 
@@ -56,26 +69,19 @@ Excluded:
   ~/.hermes/skills/github/frameworks-reactive-github/SKILL.md -- procedures
   ~/repos/frameworks-hermes/                  -- backup repo (this repo)
 
-## Known Issues
-
-1. PAT expiry (2026-05-18 to 2026-06-25): All GitHub PATs expired causing
-   missed reviews/comments. PAT regenerated on 2026-06-25. The relay's
-   memory note about expired PATs is now stale.
-
-2. "Can you" keyword trigger too broad: issue_comment and review events
-   trigger on "can you" in the body, but this matches comments not addressed
-   to the bot (e.g., PR #529 comment from scode2277 to DicksonWu654).
-   Consider requiring @mention only, or narrowing keywords.
-
-3. Relay needs restart after code changes: The running relay still has old
-   code in memory. Run: systemctl --user restart frameworks-gh-relay.service
-
 ## Resolved Issues
 
-1. PR #513 heredoc failure (fixed 2026-06-25): The agent mangled a bash
-   heredoc into a single-line command, it timed out at 60s, the retry also
-   timed out, and the PTY duplicate guard killed the spawn before any review
-   was posted. Fixed by:
-   - Replacing heredoc instructions with write_file tool instructions
-   - Adding [BLOCKED]/Blocked:/denied to the duplicate guard skip conditions
-   so failed/blocked commands don't count as completed actions.
+- PR #616 (2026-08-30): grok-4.5 high truncation + exit-0 incomplete
+  workflow. Fixed: medium reasoning + post-exit incomplete detection.
+
+## Known Issues
+
+1. "Can you" keyword trigger too broad: issue_comment and review events
+   trigger on "can you" in the body, but this matches comments not addressed
+   to the bot. Consider requiring @mention only, or narrowing keywords.
+
+2. Relay needs restart after code changes: The running relay still has old
+   code in memory. Run: systemctl --user restart frameworks-gh-relay.service
+
+3. HTTP 401/403 on final gh call may still look "completed" to the PTY
+   guard (command line seen). Incomplete detection does not cover this yet.
