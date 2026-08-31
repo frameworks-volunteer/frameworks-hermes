@@ -1305,78 +1305,74 @@ def _detect_incomplete_workflow(
             % trunc_hits[0]
         )
 
-    # 2. Unpushed commits left in THIS spawn's worktree only.
-    # Hermes logs either:
-    #   "Worktree created: /path/.worktrees/hermes-XXXX"
-    #   "Worktree has unpushed commits, keeping: /path/..."
-    # Only inspect the path from THIS output — scanning every hermes-*
-    # tree would false-positive on leftover trees from parallel/prior
-    # spawns and poison the fallback attempt.
+    # 2. Unpushed commits the BOT authored in THIS spawn's worktree.
+    # Only flag when the agent actually ran `git commit` (bot-authored
+    # work) AND there is no evidence of a successful push. Review-only
+    # spawns often fetch the PR head into a local branch (e.g. pr-592);
+    # Hermes then reports "Worktree has unpushed commits, keeping" even
+    # though those commits are the PR author's, not ours. Treating that
+    # as incomplete would false-positive every successful review that
+    # never needed to push (seen on PR #592, 2026-08-31).
     try:
-        wt_paths: list[Path] = []
-        for m in re.finditer(
-            r"Worktree (?:created|has unpushed commits, keeping):\s*"
-            r"(\S+/hermes-[0-9a-f]+)",
+        bot_committed = bool(re.search(
+            r"git commit\b.*(?:-S\b|--gpg-sign|\-F\b)",
             output_text,
-        ):
-            p = Path(m.group(1))
-            # Prefer paths under the configured worktree dir when set
-            if worktree_dir:
-                try:
-                    p.resolve().relative_to(Path(worktree_dir).resolve())
-                except (ValueError, OSError):
-                    # still accept — hermes may log absolute paths we want
-                    pass
-            if p not in wt_paths:
-                wt_paths.append(p)
-        # Also honor Hermes' own unpushed-keep warning even if path parse fails
+        )) or bool(re.search(
+            r"git commit -S\b|git commit --amend -S\b",
+            output_text,
+        ))
+        # Broader: any git commit line that is not just prompt text
+        if not bot_committed:
+            bot_committed = bool(re.search(
+                r"\$\s+.*\bgit commit\b",
+                output_text,
+            ))
+        push_ok = bool(re.search(
+            r"(To https://github\.com/|"
+            r"\[[\w./-]+ \w+\.\.\w+\]|"  # [branch abc..def]
+            r"git push\b.*(?:successfully|-> ))",
+            output_text,
+            re.IGNORECASE,
+        ))
         hermes_kept_unpushed = (
             "Worktree has unpushed commits, keeping" in output_text
         )
-        if hermes_kept_unpushed and not wt_paths:
-            reasons.append(
-                "hermes reported unpushed commits kept in worktree"
+        if bot_committed and not push_ok:
+            # Parse this spawn's worktree path for a precise message
+            wt_name = None
+            m = re.search(
+                r"Worktree (?:created|has unpushed commits, keeping):\s*"
+                r"(\S+/hermes-[0-9a-f]+)",
+                output_text,
             )
-        for wt_path in wt_paths:
-            if not wt_path.is_dir():
-                # hermes already said it kept unpushed commits
-                if hermes_kept_unpushed:
-                    reasons.append(
-                        "unpushed commits kept in worktree %s (path gone)"
-                        % wt_path.name
+            if m:
+                wt_name = Path(m.group(1)).name
+            # Confirm ahead state when the worktree still exists
+            ahead_detail = ""
+            if m:
+                wt_path = Path(m.group(1))
+                if wt_path.is_dir():
+                    chk = _run_git(
+                        "status", "--porcelain", "--branch",
+                        cwd=str(wt_path), timeout=15,
                     )
-                continue
-            chk = _run_git(
-                "status", "--porcelain", "--branch",
-                cwd=str(wt_path), timeout=15,
+                    if chk.returncode == 0:
+                        for ln in (chk.stdout or "").splitlines():
+                            if ln.startswith("##"):
+                                ahead_detail = ln.strip()
+                                break
+            reasons.append(
+                "bot committed but did not push"
+                + (" in %s" % wt_name if wt_name else "")
+                + (" (%s)" % ahead_detail if ahead_detail else "")
+                + (" [hermes kept worktree]" if hermes_kept_unpushed else "")
             )
-            if chk.returncode != 0:
-                continue
-            status_out = chk.stdout or ""
-            branch_line = ""
-            for ln in status_out.splitlines():
-                if ln.startswith("##"):
-                    branch_line = ln
-                    break
-            if "ahead" in branch_line or hermes_kept_unpushed:
-                reasons.append(
-                    "unpushed commits in worktree %s (%s)"
-                    % (wt_path.name, branch_line.strip() or "kept by hermes")
-                )
-                continue
-            # Fallback: rev-list against upstream if tracking is set
-            ahead_chk = _run_git(
-                "rev-list", "--count", "@{u}..HEAD",
-                cwd=str(wt_path), timeout=15,
+        elif hermes_kept_unpushed and not bot_committed:
+            # Informational only — do not treat as incomplete
+            log.info(
+                "Hermes kept worktree with unpushed commits but bot "
+                "did not commit in this spawn -- not flagging incomplete"
             )
-            if (
-                ahead_chk.returncode == 0
-                and (ahead_chk.stdout or "").strip() not in ("", "0")
-            ):
-                reasons.append(
-                    "unpushed commits in worktree %s (rev-list %s)"
-                    % (wt_path.name, (ahead_chk.stdout or "").strip())
-                )
     except Exception as e:
         log.debug("incomplete-check worktree scan failed: %s", e)
 
