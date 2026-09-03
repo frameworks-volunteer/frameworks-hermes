@@ -54,13 +54,29 @@ BOT_USERNAME    = os.environ.get("BOT_USERNAME", "frameworks-volunteer")
 ALLOWED_SENDERS = [s.strip().lower() for s in os.environ.get("ALLOWED_SENDERS", "").split(",") if s.strip()]
 
 # Model fallback chain: must be configured via MODEL_CHAIN env var.
-# Format: provider/model, comma-separated. First is primary.
+# Format: provider/model[@reasoning], comma-separated. First is primary.
+# Optional @level sets per-model reasoning effort (default: medium).
+# Example: openrouter/x-ai/grok-4.5@high,openrouter/z-ai/glm-5.2@medium
 _model_chain_raw = os.environ.get("MODEL_CHAIN", "")
 if not _model_chain_raw:
     print("ERROR: MODEL_CHAIN not configured. Set it in config.env.", file=sys.stderr)
     sys.exit(1)
+
+
+def _parse_chain_entry(entry: str) -> tuple[str, str, str]:
+    """Parse 'provider/model[@reasoning]' -> (provider, model, reasoning)."""
+    entry = entry.strip()
+    reasoning = "medium"
+    if "@" in entry:
+        entry, _, level = entry.partition("@")
+        if level.strip():
+            reasoning = level.strip()
+    provider, model = entry.split("/", 1)
+    return (provider.strip(), model.strip(), reasoning)
+
+
 MODEL_CHAIN = [
-    tuple(m.strip().split("/", 1))
+    _parse_chain_entry(m.strip())
     for m in _model_chain_raw.split(",") if m.strip()
 ]
 if not MODEL_CHAIN:
@@ -70,13 +86,13 @@ if not MODEL_CHAIN:
 # Backwards compat: single DEFAULT_MODEL still works
 if os.environ.get("DEFAULT_MODEL"):
     dp = os.environ.get("DEFAULT_PROVIDER", "openrouter")
-    MODEL_CHAIN.insert(0, (dp, os.environ["DEFAULT_MODEL"]))
+    MODEL_CHAIN.insert(0, (dp, os.environ["DEFAULT_MODEL"], "medium"))
 
 # Self-review alternates (used when reviewing bot's own PRs)
 _self_review_raw = os.environ.get("SELF_REVIEW_MODELS", "")
 if _self_review_raw:
     SELF_REVIEW_MODELS = [
-        tuple(m.strip().split("/", 1))
+        _parse_chain_entry(m.strip())
         for m in _self_review_raw.split(",") if m.strip()
     ]
 else:
@@ -574,14 +590,17 @@ def _process_work_item(item):
     else:
         model_list = MODEL_CHAIN
 
+    # try_order entries are (provider, model, reasoning) triples.
     primary = (provider, model)
-    try_order = [primary]
-    for p, m in model_list:
-        if (p, m) != primary:
-            try_order.append((p, m))
+    try_order = []
+    for p, m, r_level in model_list:
+        if (p, m) == primary:
+            try_order.insert(0, (p, m, r_level))
+        else:
+            try_order.append((p, m, r_level))
 
-    for i, (prov, mod) in enumerate(try_order):
-        prompt = build_prompt(classified, prov, mod, reasoning,
+    for i, (prov, mod, prov_reasoning) in enumerate(try_order):
+        prompt = build_prompt(classified, prov, mod, prov_reasoning,
                               self_review, payload)
         # Cross-spawn dedup: if an earlier attempt in THIS chain already
         # posted the required review/comment for this exact target, do
@@ -598,6 +617,7 @@ def _process_work_item(item):
         result = spawn_hermes(
             prompt,
             prov, mod, scope=classified["scope"],
+            reasoning=prov_reasoning,
         )
         if result is True:
             log.info("Completed: %s (model=%s/%s)",
@@ -718,7 +738,7 @@ def spawn_rescue(stuck_spawn_id: str, stuck_log_file: str,
 
     # Use a different model than the one that got stuck
     rescue_models = MODEL_CHAIN[1:] if len(MODEL_CHAIN) > 1 else MODEL_CHAIN
-    prov, mod = rescue_models[0]
+    prov, mod, _rescue_reasoning = rescue_models[0]
 
     log.info("[rescue %s] Spawning rescue agent: %s/%s", rescue_id, prov, mod)
 
@@ -729,6 +749,7 @@ def spawn_rescue(stuck_spawn_id: str, stuck_log_file: str,
         HERMES_BIN, "chat",
         "--provider", prov,
         "--model", mod,
+        "--reasoning", _rescue_reasoning,
         "--skills", "frameworks-reactive-github,github-auth,github-issues,"
                     "github-pr-workflow,github-code-review,"
                     "caveman,rtk,superpowers,using-superpowers,"
@@ -1038,13 +1059,12 @@ def choose_model(classified: dict, payload: dict) -> tuple[str, str, str, str]:
     if is_self_review and SELF_REVIEW_MODELS:
         # Deterministic alternation across self-review models
         pr_num = payload.get("pull_request", {}).get("number", 0)
-        provider, model = SELF_REVIEW_MODELS[pr_num % len(SELF_REVIEW_MODELS)]
-        reasoning = "medium"
+        provider, model, reasoning = SELF_REVIEW_MODELS[
+            pr_num % len(SELF_REVIEW_MODELS)]
         return provider, model, reasoning, "1"
 
-    # Default: primary model from chain at medium reasoning
-    provider, model = MODEL_CHAIN[0]
-    reasoning = "medium"
+    # Default: primary model from chain with its configured reasoning
+    provider, model, reasoning = MODEL_CHAIN[0]
     return provider, model, reasoning, "0"
 
 # ---------------------------------------------------------------------------
@@ -1556,7 +1576,7 @@ def _action_already_posted(scope: str, prompt_text: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def spawn_hermes(prompt: str, provider: str, model: str,
-                 scope: str = "") -> bool | None:
+                 scope: str = "", reasoning: str = "medium") -> bool | None:
     """Spawn Hermes in one-shot mode and wait for it to finish.
 
     Returns:
@@ -1593,6 +1613,7 @@ def spawn_hermes(prompt: str, provider: str, model: str,
         "chat",
         "--provider", provider,
         "--model", model,
+        "--reasoning", reasoning,
         "--skills", "frameworks-reactive-github,github-auth,github-issues,"
                     "github-pr-workflow,github-code-review,"
                     "caveman,rtk,superpowers,using-superpowers,"
@@ -1640,6 +1661,7 @@ def spawn_hermes(prompt: str, provider: str, model: str,
                 env={**os.environ,
                      "HERMES_MODEL": model,
                      "HERMES_PROVIDER": provider,
+                     "HERMES_REASONING": reasoning,
                      # Prevent git from trying to open an interactive editor
                      # during rebase --continue or commit --amend. Without
                      # these, git falls back to nano which fails on a PTY
@@ -2128,10 +2150,10 @@ def main():
     log.info("Worktrees: dir=%s cleanup_on_merge=%s stale_hours=%d",
              WORKTREE_DIR, CLEANUP_ON_MERGE, STALE_WORKTREE_HOURS)
     log.info("Model chain: %s",
-             " -> ".join(f"{p}/{m}" for p, m in MODEL_CHAIN))
+             " -> ".join(f"{p}/{m}@{r}" for p, m, r in MODEL_CHAIN))
     if SELF_REVIEW_MODELS:
         log.info("Self-review models: %s",
-                 " -> ".join(f"{p}/{m}" for p, m in SELF_REVIEW_MODELS))
+                 " -> ".join(f"{p}/{m}@{r}" for p, m, r in SELF_REVIEW_MODELS))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
