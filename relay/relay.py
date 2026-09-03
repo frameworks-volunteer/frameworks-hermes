@@ -581,13 +581,22 @@ def _process_work_item(item):
             try_order.append((p, m))
 
     for i, (prov, mod) in enumerate(try_order):
+        prompt = build_prompt(classified, prov, mod, reasoning,
+                              self_review, payload)
+        # Cross-spawn dedup: if an earlier attempt in THIS chain already
+        # posted the required review/comment for this exact target, do
+        # not spawn again -- a re-post is duplicate spam (PR #620).
+        if i > 0 and _action_already_posted(classified["scope"], prompt):
+            log.warning("Skipping %s/%s for %s: required action already "
+                        "posted by an earlier attempt (cross-spawn dedup)",
+                        prov, mod, classified["scope"])
+            continue
         log.info("Processing: scope=%s provider=%s model=%s "
                  "sender=%s (attempt %d/%d)",
                  classified["scope"], prov, mod, sender,
                  i + 1, len(try_order))
         result = spawn_hermes(
-            build_prompt(classified, prov, mod, reasoning,
-                         self_review, payload),
+            prompt,
             prov, mod, scope=classified["scope"],
         )
         if result is True:
@@ -1282,6 +1291,77 @@ _TRUNCATION_MARKERS = (
 )
 
 
+def _scope_action_evidenced(scope: str, output_text: str,
+                            completed_actions: set) -> bool:
+    """True when the scope's required GitHub action shows evidence of
+    having been submitted. Three evidence sources, strongest first:
+      1. PTY-guard membership (completed_actions)
+      2. An executed (not prompt-echoed) gh command line, excluding
+         blocked/denied/errored lines -- mirrors the PTY guard filters
+      3. Positive output evidence (API success text / comment URLs)
+    Used to suppress false-positive incomplete detection
+    (PR #620, 2026-09-03)."""
+    exec_marker = chr(0x1F4BB) + " $"  # Hermes executed-command marker
+
+    def _ran(pattern: str) -> bool:
+        for ln in output_text.splitlines():
+            if exec_marker not in ln:
+                continue  # prompt echo, not an executed command
+            if "[error]" in ln or "[BLOCKED]" in ln:
+                continue
+            if "Blocked:" in ln or "denied" in ln.lower():
+                continue
+            if re.search(pattern, ln):
+                return True
+        return False
+
+    if scope in _REVIEW_SCOPES:
+        if "review" in completed_actions or "pr_comment" in completed_actions:
+            return True
+        if _ran(r"gh pr review\s+\d+"):
+            return True
+        return bool(re.search(
+            r"(Submitted|approved|requested changes|commented|"
+            r"gh pr review.*successfully|Review submitted)",
+            output_text,
+            re.IGNORECASE,
+        ))
+    if scope in _COMMENT_SCOPES:
+        if ("pr_comment" in completed_actions
+                or "issue_comment" in completed_actions):
+            return True
+        if _ran(r"gh (?:pr|issue) comment\s+\d+"):
+            return True
+        return bool(re.search(
+            r"(gh (?:pr|issue) comment.*successfully|"
+            r"https://github\.com/.+/pull/\d+#issuecomment-|"
+            r"https://github\.com/.+/issues/\d+#issuecomment-|"
+            r"Comment created|commented on)",
+            output_text,
+            re.IGNORECASE,
+        ))
+    if scope in _ISSUE_FIX_SCOPES:
+        has_pr = bool(re.search(
+            r"(gh pr create.*https://github\.com/.+/pull/\d+|"
+            r"https://github\.com/.+/pull/\d+|"
+            r"pull request created|Created pull request)",
+            output_text,
+            re.IGNORECASE,
+        )) or _ran(r"gh pr create\b.*pull/\d+")
+        has_comment = (
+            "issue_comment" in completed_actions
+            or _ran(r"gh issue comment\s+\d+")
+            or bool(re.search(
+                r"(gh issue comment.*successfully|"
+                r"https://github\.com/.+/issues/\d+#issuecomment-)",
+                output_text,
+                re.IGNORECASE,
+            ))
+        )
+        return has_pr or has_comment
+    return False
+
+
 def _detect_incomplete_workflow(
     scope: str,
     output_text: str,
@@ -1297,36 +1377,44 @@ def _detect_incomplete_workflow(
     """
     reasons: list[str] = []
 
+    # Positive evidence that the scope's required action landed. If it
+    # did, a mid-run truncation marker does NOT make the workflow
+    # incomplete -- Hermes may truncate and recover, then submit.
+    # (PR #620, 2026-09-03: grok-4.5 truncated, recovered, submitted the
+    # APPROVE review; the raw marker still caused a chain-wide fallback
+    # that re-reviewed the same unchanged PR 3 more times.)
+    action_evidenced = _scope_action_evidenced(
+        scope, output_text, completed_actions)
+
     # 1. Output-length truncation / aborted tool-call loops
     trunc_hits = [m for m in _TRUNCATION_MARKERS if m in output_text]
-    if trunc_hits:
+    if trunc_hits and not action_evidenced:
         reasons.append(
             "output truncated/aborted mid-tool-call (%s)"
             % trunc_hits[0]
         )
 
     # 2. Unpushed commits the BOT authored in THIS spawn's worktree.
-    # Only flag when the agent actually ran `git commit` (bot-authored
-    # work) AND there is no evidence of a successful push. Review-only
-    # spawns often fetch the PR head into a local branch (e.g. pr-592);
-    # Hermes then reports "Worktree has unpushed commits, keeping" even
-    # though those commits are the PR author's, not ours. Treating that
-    # as incomplete would false-positive every successful review that
-    # never needed to push (seen on PR #592, 2026-08-31).
+    # Only flag when the agent actually EXECUTED `git commit` AND there
+    # is no evidence of a successful push. Evidence is restricted to
+    # executed-command lines (Hermes prints `💻 $ <cmd>` when a tool
+    # runs) -- the PTY transcript also echoes the relay's own prompt,
+    # and the prompt contains literal "always use git commit -S"
+    # instructions. Scanning the full transcript false-positives every
+    # review-only spawn: it never commits and never pushes, so it was
+    # flagged "bot committed but did not push" and the chain fell
+    # through all 4 models, re-reviewing the same PR each time
+    # (PR #620, 2026-09-03).
     try:
-        bot_committed = bool(re.search(
-            r"git commit\b.*(?:-S\b|--gpg-sign|\-F\b)",
-            output_text,
-        )) or bool(re.search(
-            r"git commit -S\b|git commit --amend -S\b",
-            output_text,
-        ))
-        # Broader: any git commit line that is not just prompt text
-        if not bot_committed:
-            bot_committed = bool(re.search(
-                r"\$\s+.*\bgit commit\b",
-                output_text,
-            ))
+        exec_marker = chr(0x1F4BB) + " $"  # Hermes executed-command marker
+        executed_lines = [
+            ln for ln in output_text.splitlines()
+            if exec_marker in ln
+        ]
+        bot_committed = any(re.search(
+            r"\bgit commit\b",
+            ln,
+        ) for ln in executed_lines)
         push_ok = bool(re.search(
             r"(To https://github\.com/|"
             r"\[[\w./-]+ \w+\.\.\w+\]|"  # [branch abc..def]
@@ -1379,53 +1467,24 @@ def _detect_incomplete_workflow(
     # 3. Scope-required GitHub action never submitted
     # completed_actions is populated by the PTY guard when it sees a real
     # `gh pr review N` / `gh pr comment N` / `gh issue comment N` line.
+    # action_evidenced covers the same conditions (incl. positive output
+    # evidence) -- if the action landed, do not flag incomplete.
     if scope in _REVIEW_SCOPES:
-        if "review" not in completed_actions and "pr_comment" not in completed_actions:
-            # Also accept successful API evidence in the log (race with kill)
-            if not re.search(
-                r"(Submitted|approved|requested changes|commented|"
-                r"gh pr review.*successfully|Review submitted)",
-                output_text,
-                re.IGNORECASE,
-            ):
-                reasons.append(
-                    "scope %s requires a PR review/comment but none was submitted"
-                    % scope
-                )
+        if not action_evidenced:
+            reasons.append(
+                "scope %s requires a PR review/comment but none was submitted"
+                % scope
+            )
     elif scope in _COMMENT_SCOPES:
-        if "pr_comment" not in completed_actions and "issue_comment" not in completed_actions:
-            if not re.search(
-                r"(gh (?:pr|issue) comment.*successfully|"
-                r"https://github\.com/.+/pull/\d+#issuecomment-|"
-                r"https://github\.com/.+/issues/\d+#issuecomment-|"
-                r"Comment created|commented on)",
-                output_text,
-                re.IGNORECASE,
-            ):
-                reasons.append(
-                    "scope %s requires a comment but none was submitted"
-                    % scope
-                )
+        if not action_evidenced:
+            reasons.append(
+                "scope %s requires a comment but none was submitted"
+                % scope
+            )
     elif scope in _ISSUE_FIX_SCOPES:
         # issue_assigned should produce a PR (or at least a status comment).
         # Detect either a successful `gh pr create` or an issue comment.
-        has_pr = bool(re.search(
-            r"(gh pr create.*https://github\.com/.+/pull/\d+|"
-            r"https://github\.com/.+/pull/\d+|"
-            r"pull request created|Created pull request)",
-            output_text,
-            re.IGNORECASE,
-        ))
-        has_comment = (
-            "issue_comment" in completed_actions
-            or bool(re.search(
-                r"(gh issue comment.*successfully|"
-                r"https://github\.com/.+/issues/\d+#issuecomment-)",
-                output_text,
-                re.IGNORECASE,
-            ))
-        )
-        if not has_pr and not has_comment:
+        if not action_evidenced:
             # Only flag if the agent actually started work (tools ran) —
             # empty/near-empty spawns are caught by truncation above.
             if "git " in output_text or "gh " in output_text:
@@ -1442,6 +1501,54 @@ def _detect_incomplete_workflow(
             seen.add(r)
             unique.append(r)
     return unique
+
+
+# ---------------------------------------------------------------------------
+# Cross-spawn action dedup (PR #620, 2026-09-03). When a chain falls
+# through after the first model ALREADY submitted the required action
+# (review/comment), later attempts must not post again. The per-spawn
+# PTY guard cannot see sibling spawns; this registry can.
+# ---------------------------------------------------------------------------
+
+_cross_spawn_actions: dict = {}  # (scope, repo, number) -> {"models": set()}
+
+
+def _register_completed_action(scope: str, output_text: str) -> None:
+    """If this spawn's log shows the scope's required action landed,
+    remember it so fallback attempts on the same target do not re-post."""
+    if scope not in (_REVIEW_SCOPES | _COMMENT_SCOPES):
+        return
+    m = re.search(
+        r"gh (?:pr review|pr comment|issue comment)\s+(\d+)"
+        r"\s+--repo\s+(\S+)",
+        output_text,
+    )
+    if not m:
+        return
+    number, repo = m.group(1), m.group(2)
+    key = (scope, repo, number)
+    _cross_spawn_actions.setdefault(key, {})["posted"] = True
+    log.info("Cross-spawn action registered: %s %s #%s -- fallbacks "
+             "will not re-post", scope, repo, number)
+
+
+def _action_already_posted(scope: str, prompt_text: str) -> bool:
+    """True when a previous attempt for this same review/comment target
+    already posted the required action. The prompt is scanned for the
+    canonical fetch command the relay writes into every prompt."""
+    if scope not in (_REVIEW_SCOPES | _COMMENT_SCOPES):
+        return False
+    m = re.search(
+        r"gh (?:pr review|pr comment|issue comment)\s+(\d+)"
+        r"\s+--repo\s+(\S+)",
+        prompt_text,
+    )
+    if not m:
+        return False
+    number, repo = m.group(1), m.group(2)
+    key = (scope, repo, number)
+    entry = _cross_spawn_actions.get(key)
+    return bool(entry and entry.get("posted"))
 
 
 # ---------------------------------------------------------------------------
@@ -1814,6 +1921,9 @@ def spawn_hermes(prompt: str, provider: str, model: str,
                  "duration=%s msgs=%s tools=%d output=%s",
                  spawn_id, proc.returncode, session_id,
                  duration, msg_count, tool_count, log_file.name)
+        # Record that this spawn's required action landed so chain
+        # fallbacks on the same target do not re-post (PR #620).
+        _register_completed_action(scope, output_text)
         return True
 
     except subprocess.TimeoutExpired:
